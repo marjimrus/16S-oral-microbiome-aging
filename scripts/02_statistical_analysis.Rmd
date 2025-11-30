@@ -1,0 +1,2592 @@
+---
+title: "Oral Microbiome and Salivary Estrogen Analysis"
+author: "Maria J. Rus"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Knitr Setup
+```{r}
+### ===================
+###   Knitr setup
+### ===================
+
+# Load the knitr library for dynamic report generation
+library(knitr)
+
+# Set global chunk options for knitr
+opts_chunk$set(
+  tidy = FALSE,       # Do not reformat code in chunks
+  cache = TRUE,       # Enable caching to speed up knitting
+  echo = FALSE,       # Do not display the R code in the output
+  warning = FALSE,    # Suppress warnings in the output
+  message = FALSE,    # Suppress messages in the output
+  dpi = 300,          # Set the resolution of plots
+  fig.width = 8,      # Set the width of the figures
+  fig.height = 8,     # Set the height of the figures
+  fig.align = "center" # Center align the figures
+)
+
+```
+
+
+# R Packages
+```{r}
+### ===================
+###   R packages
+### ===================
+
+# Load packages for data manipulation and cleaning
+library(readxl)       # Read Excel files
+library(janitor)      # Clean and format data
+
+# Load packages for phylogenetic and ecological analysis
+library(ape)          # Analyses of Phylogenetics and Evolution
+library(vegan)        # Community ecology analysis, including diversity and ordination
+library(qiimer)       # Phylogenetic tree analysis and more
+library(usedist)      # Dissimilarity analysis
+library(phyloseq)     # Manage and analyze phylogenetic sequencing data
+library(ecole)        # Ecological and environmental data analysis
+
+# Load packages for data manipulation and visualization
+library(tidyverse)    # Data science packages including ggplot2, dplyr, and others
+library(dplyr)        # Data manipulation
+library(tibble)       # Data frames
+library(ggplot2)      # Data visualization
+library(ggdist)
+library(ggbeeswarm)   # Pretty beeswarm plots
+library(ggtern)       # Ternary diagrams
+library(ggthemes)     # Additional themes for ggplot2
+library(reshape2)     # Reshape data
+library(viridis)      # Color palettes
+library(RColorBrewer) # Color palettes
+library(ggrepel)      # Repel overlapping text labels
+library(ggsci)        # Scientific journal color palettes
+library(ggpubr)       # Publication-ready plots
+
+```
+
+
+```{r eval=FALSE, include=}
+### ================================================
+###   Install specific package versions (if needed)
+### ================================================
+
+# Install the 'remotes' package to allow installation of specific package versions
+install.packages("remotes")
+
+# Check the current version of the 'ggplot2' package
+packageDescription("ggplot2")
+packageVersion("ggplot2")
+
+# Install a specific version of the 'ggplot2' package to resolve compatibility issues
+remove.packages("ggplot2")
+remotes::install_version("ggplot2", version = "3.4.0")
+
+# Install a package from a local source
+install.packages("~/Desktop/code_club/ggdist/", repos = NULL, type = "source")
+
+```
+
+
+# Define Constants
+```{r}
+### ===========================
+###   Define constants
+### ===========================
+
+# Minimum reads threshold
+min_reads <- 1000
+
+# Set the working directory root path
+root_dir <- "/MariaJ.Rus/"
+
+# File paths for various data files obtained from analysis with QIIME2
+### Mapping file path
+mapping_file_fp <- file.path(root_dir, "Databases/metadata.xlsx")
+### OTU table file path
+feature_table_fp <- file.path(root_dir, "R/feature-table/feature-table.tsv")
+### Taxonomic assignment file path
+taxo_assignment_fp <- file.path(root_dir, "R/taxonomy/taxonomy.tsv")
+### Bray-Curtis Dissimilarities file path
+bc_fp <- file.path(root_dir, "R/extras/core-metrics-results/bray/distance-matrix.tsv") 
+### Faith Phylogenetic Diversity file path
+faith_fp <- file.path(root_dir, "R/core-metrics-results/faith/alpha-diversity.tsv")
+
+```
+
+
+# Theme for Plots
+```{r}
+### ===========================
+###   Define theme for plots
+### ===========================
+
+# Define a custom theme for boxplots
+theme_set(theme_classic() + theme(
+axis.line.x = element_line(colour = 'black', linewidth=0.5, linetype='solid'),
+axis.line.y = element_line(colour = 'black', linewidth=0.5, linetype='solid'))) 
+theme_boxplot <- function () {theme_base(base_size = 12) + 
+                theme(line = element_line(linewidth=0.8),
+                text = element_text(size = 18),
+                axis.text.x = element_text(color="black"),
+                axis.text.y = element_text(color="black"),
+                plot.background = element_blank(),
+                panel.border = element_rect(colour = "black", size = 0.8)
+               )}
+
+```
+
+
+#-------------------------------
+
+# Microbiome Data Preparation and Quality Control 
+```{r}
+### ===========================
+###   Read in data
+### ===========================
+
+# Read the mapping file
+s <- read_excel(mapping_file_fp)
+
+```
+
+```{r}
+### ===========================
+###   Read OTU table and process taxonomic assignments
+### ===========================
+
+# Read taxonomic assignment file
+assignments <- read_tsv(file = taxo_assignment_fp) 
+
+# Introduce space after semicolon for compatibility with HOMD database
+assignments$Taxon <- gsub(";", "; ", assignments$Taxon)
+
+# Process taxonomic assignments
+assignments <- assignments %>%
+  dplyr::rename(Lineage = Taxon, OtuID = `Feature ID`) %>%
+  do(bind_cols(., split_assignments(.$Lineage))) %>%
+  mutate_at(taxonomic_ranks, ~str_remove(., "[kpcofgs]__")) %>%
+  mutate_at(taxonomic_ranks, ~na_if(., "")) %>%
+  mutate(Assignment = simplify_assignments(.[taxonomic_ranks], rank1 = "Phylum"))
+
+# Read OTU table and process counts
+otu_counts <- readr::read_tsv(feature_table_fp, skip = 1) %>%
+  dplyr::rename(OtuID = "#OTU ID") %>%
+  gather(SampleID, Counts, -OtuID) %>%
+  left_join(assignments, by = "OtuID") %>%
+  filter(!str_detect(Family, "mitochondria")) %>%
+  filter(!str_detect(Class, "Chloroplast")) %>%
+  filter(!str_detect(Kingdom, "Unassigned")) %>%
+  filter(!str_detect(Kingdom, "Archaea")) %>%
+  group_by(SampleID) %>%
+  filter(sum(Counts) > 0)
+
+# Check if all OTUs in counts table are in the taxonomic assignments table
+if (!all(otu_counts$OtuID %in% assignments$OtuID)) {
+  stop("Some OTUs not in taxonomic assignments table")
+}
+
+# Summarize assignment counts and proportions
+assignment_counts <- otu_counts %>%
+  group_by(SampleID, Assignment) %>%
+  summarize(Counts = sum(Counts)) %>%
+  ungroup() %>%
+  group_by(SampleID) %>%
+  mutate(Proportion = Counts / sum(Counts)) %>%
+  ungroup()
+
+# Summarize read counts
+read_counts <- otu_counts %>%
+  group_by(SampleID) %>%
+  summarize(NumReads = sum(Counts))
+
+```
+```{r}
+### ===========================
+###   Check for missing samples
+### ===========================
+### Possible issue 1: Samples found in the sample sheet but not in the feature table (0 reads)
+
+# Identify samples in the sample sheet but not in the feature table
+s %>%
+  filter(!(SampleID %in% read_counts$SampleID)) %>%
+  dplyr::select(SampleID, SampleType)
+
+```
+
+```{r}
+
+### Possible issue 2: Samples found in the feature table but not in the sample sheet. There must be an error!
+
+# Identify samples in the feature table but not in the sample sheet
+read_counts %>%
+  filter(!(SampleID %in% s$SampleID))
+```
+
+```{r}
+### ===========================
+###   Quantify samples above read count threshold
+### ===========================
+
+# Quantify whole samples that are above the minimum read count threshold
+s %>%
+  left_join(read_counts, by = "SampleID") %>%
+  mutate(NumReads = replace_na(NumReads, 0)) %>%
+  mutate(Keep = if_else(NumReads > min_reads, "Keep", "Discard")) %>%
+  count(SampleType, Keep) %>%
+  spread(Keep, n)
+
+```
+
+```{r}
+### ===========================
+###   Histogram of high quality paired reads per sample
+### ===========================
+
+# The black dashed vertical line shows the minimum number of reads (min_reads) for analysis. Control samples, if any, were included in the histogram.
+s %>%
+  left_join(read_counts, by = "SampleID") %>%
+  ggplot(aes(x = NumReads)) +
+  geom_histogram(aes(fill = SampleType), binwidth = 1000) +
+  scale_fill_d3() +
+  labs(x = "Number of reads", y = "Number of samples") +
+  theme_bw() +
+  geom_vline(xintercept = min_reads, linetype = "dashed", color = "black")  # Added vertical line for min_reads
+
+```
+
+```{r}
+### ===========================
+###   Filter samples based on read count threshold
+### ===========================
+
+# Keep only those samples with more than the minimum reads threshold
+s <- s %>%
+  left_join(read_counts, by = "SampleID") %>%
+  filter(NumReads > min_reads)  # We will keep those samples with more than 1000 reads.
+
+```
+
+
+# Decontamination Process
+To ensure the accuracy of our microbial community analysis, we performed decontamination to identify and remove contaminating DNA. We used the `decontam` package, which offers statistical methods to detect contaminants based on frequency and prevalence. Due to the absence of DNA concentration data, we relied on the prevalence method.
+
+For more information on how to use the `decontam` package, refer to the following resources:
+- Paper to cite: DOI [https://doi.org/10.1186/s40168-018-0605-2](https://doi.org/10.1186/s40168-018-0605-2)
+- How to use the tool: [Decontam Introduction](https://benjjneb.github.io/decontam/vignettes/decontam_intro.html#identifying-contaminants-in-marker-gene-and-metagenomics-data)
+
+```{r}
+### ===========================
+###   Data Preparation for Decontamination
+### ===========================
+
+# Load the decontam package
+library(decontam)
+
+# Filter out unwanted subjects and sample types
+decontam_s <- s %>%
+  filter(SubjectID != "CTRPOS") %>% 
+  filter(SampleType != "SSA") %>%
+  dplyr::select(-SubjectID, -Project)
+
+# Prepare abundance table for decontam
+decontam_assignment_counts <- assignment_counts %>%
+  filter(SampleID %in% decontam_s$SampleID) %>%
+  mutate(Assignment = fct_lump(Assignment, n = Inf, w = Proportion)) %>%
+  group_by(SampleID, Assignment) %>%
+  summarize(Proportion = sum(Proportion)) %>%
+  ungroup() %>%
+  left_join(decontam_s, by = "SampleID") %>%
+  mutate(TaxonLabel = str_remove(Assignment, "^\\w+ ")) %>%
+  mutate(Phylum = str_replace(Assignment, "^(\\w+)\\s.*", "\\1"))
+
+# Pivot wider for abundance table
+decontam_abundance_table <- pivot_wider(
+  data = decontam_assignment_counts, 
+  id_cols = "SampleID", 
+  names_from = "TaxonLabel", 
+  values_from = "Proportion"
+)
+
+# Prepare metadata and abundance tables
+SampleID_decontam_s <- decontam_s$SampleID
+SampleID_decontam_abundance_table <- decontam_abundance_table$SampleID
+
+decontam_s <- decontam_s %>% dplyr::select(-SampleID)
+rownames(decontam_s) <- SampleID_decontam_s
+decontam_abundance_table <- decontam_abundance_table %>% dplyr::select(-SampleID)
+rownames(decontam_abundance_table) <- SampleID_decontam_abundance_table
+decontam_abundance_table <- t(decontam_abundance_table)
+
+# Convert the abundance table to a matrix
+decontam_abundance_table <- as.matrix(decontam_abundance_table)
+
+### ===========================
+###   Create Phyloseq Object
+### ===========================
+
+# Create a phyloseq object from abundance and metadata tables
+OTU <- otu_table(decontam_abundance_table, taxa_are_rows = TRUE)
+SAM <- sample_data(decontam_s)
+rownames(SAM) <- SampleID_decontam_s
+
+physeq <- phyloseq(OTU, SAM)
+
+### ===========================
+###   Decontamination
+### ===========================
+
+# Define negative control samples in metadata
+sample_data(physeq)$is.neg <- sample_data(physeq)$SampleType == "control"
+
+# Identify contaminants based on prevalence method
+contam_prev <- isContaminant(physeq, method = "prevalence", neg = "is.neg")
+
+# Review contaminant results
+head(contam_prev)
+
+# Remove identified contaminants from the phyloseq object
+physeq_clean_prev <- prune_taxa(!contam_prev$contaminant, physeq)
+
+### ===========================
+###   Transform and Prepare Cleaned Data
+### ===========================
+
+# Transform the phyloseq object to an OTU table dataframe
+abundance_table_clean <- otu_table(physeq_clean_prev)
+
+# Convert the matrix to a dataframe for easier manipulation
+abundance_table_clean <- as.data.frame(t(abundance_table_clean))
+abundance_table_clean$SampleID <- row.names(abundance_table_clean)
+abundance_table_clean <- abundance_table_clean %>%
+  dplyr::select(SampleID, everything()) %>%
+  remove_rownames()
+
+```
+
+
+#-------------------------------
+
+# Data Integration
+```{r}
+### ===========================
+###   Data Integration 
+### ===========================
+
+# Read systemic database and select relevant columns
+systemic_db <- read_excel("Databases/Systemic_db.xlsx") %>%
+  dplyr::select(-18:-20, -22)
+
+# Read oral database and select relevant columns from each sheet
+oral_db <- read_excel("Databases/Oral_db.xlsm", sheet = 1) %>%
+  dplyr::select(1:2, 9:14)
+teeth_db <- read_excel("Databases/Oral_db.xlsm", sheet = 2) %>%
+  dplyr::select(1, 30:34)
+periodontal_db <- read_excel("Databases/Oral_db.xlsm", sheet = 3) %>%
+  dplyr::select(1, 8)
+saliva_db <- read_excel("Databases/Oral_db.xlsm", sheet = 4) %>%
+  dplyr::select(1, 3, 5) %>%
+  rename(Saliva_ST = ST_Flow, Saliva_SA = SA_Flow)
+
+# Normalize Saliva Flow
+## These columns show the resting (SA) and stimulated (ST) salivary flow collected during 5 minutes.
+## We want to work with the salivary flow rate per minute.
+saliva_db$Saliva_SA <- as.numeric(saliva_db$Saliva_SA) / 5  
+saliva_db$Saliva_ST <- as.numeric(saliva_db$Saliva_ST) / 5
+## 0.3 is the normal flow rate per minute in SA. 
+## 1.5 is the normal flow rate per minute in ST. 
+## Generate a column that indicates whether patients have normosalivation or hyposalivation.
+saliva_db <- saliva_db %>%
+  mutate(SA_Hyposalivation = ifelse(Saliva_SA < 0.3, 1, 0),   # Hyposalivation if SA < 0.3
+         ST_Hyposalivation = ifelse(Saliva_ST < 1.5, 1, 0))  # Hyposalivation if ST < 1.5
+
+# Read salivary estradiol levels
+estradiol <- read_xlsx("Databases/Salivary_estradiol_level.xlsx", sheet = 2) %>%
+  na.omit() %>%
+  rename(Estradiol = Salivary_estradiol_level) %>%
+  mutate(Estradiol = as.numeric(Estradiol))
+
+# Read salivary estrone levels 
+estrone <- read_xlsx("Databases/Salivary_estrone_level.xlsx", sheet = 2) %>%
+  na.omit() %>%
+  mutate(Estrone = as.numeric(Estrone))
+
+# Integrate oral and systemic databases
+s <- s %>% 
+  merge(systemic_db, by = "SubjectID") %>% 
+  merge(oral_db, by = "SubjectID") %>% 
+  merge(teeth_db, by = "SubjectID") %>% 
+  merge(periodontal_db, by = "SubjectID") %>%
+  merge(saliva_db, by = "SubjectID") %>% 
+  merge(estradiol, by = "SubjectID") %>%
+  merge(estrone, by = "SubjectID") %>%
+  merge(abundance_table_clean, by = "SampleID") 
+
+# Subset for specific niches and clean up columns
+s_niches <- s %>% 
+  filter(SampleType %in% c("BM", "TG", "GM", "TH")) %>%
+  dplyr::select(-Project, -NumReads)
+
+# Create dataframes per sample type
+s_TH <- s_niches %>% filter(SampleType == "TH")
+s_GM <- s_niches %>% filter(SampleType == "GM")
+s_BM <- s_niches %>% filter(SampleType == "BM")
+s_TG <- s_niches %>% filter(SampleType == "TG")
+
+
+```
+
+#-------------------------------
+
+# FIGURE 1
+## B-D) Oral Profile
+```{r}
+### ===========================
+###   Data Preparation
+### ===========================
+
+# Filter the data for samples of type "TG" and select relevant columns ("TG", as an example, we only want one sample per patient).
+oral_status_data <- s_niches %>%
+  filter(SampleType == "TG") %>%
+  dplyr::select(1, 37:49)
+
+# Convert the Periodontal_Diagnosis column to factors
+oral_status_data$Periodontal_Diagnosis <- as.factor(oral_status_data$Periodontal_Diagnosis)
+
+# Create binary columns for periodontal diagnosis
+perio_matrix_binary <- model.matrix(~ Periodontal_Diagnosis - 1, data = oral_status_data)
+perio_df_binary <- as.data.frame(perio_matrix_binary)
+colnames(perio_df_binary) <- c("Healthy_Periodontum", "Gingivitis1", "Gingivitis2", "Moderate_Periodontitis", "Severe_Periodontitis", "Not_Recorded")
+perio_df_binary$Gingivitis <- as.integer(perio_df_binary$Gingivitis1 | perio_df_binary$Gingivitis2)
+
+# Combine the data frames
+oral_status_data <- cbind(oral_status_data, perio_df_binary)
+
+# Create an ATM column that combines various ATM symptoms/signs columns
+oral_status_data$ATM <- as.integer(oral_status_data$ATM_Symptoms | oral_status_data$ATM_Signs | oral_status_data$ATM_Click | oral_status_data$ATM_palpation | oral_status_data$`ATM_Aperture-limitation(<30mm)`)
+
+# Convert all numeric columns to 1 or 0 based on their value
+oral_status_data <- oral_status_data %>% 
+  mutate(across(where(is.numeric), ~if_else(. > 0, 1, .)))
+
+# Create a subset of relevant data for oral status analysis
+oral_status_data_subset <- oral_status_data %>% 
+  dplyr::select(SampleID, Extraoral, N_Mucosa, ATM, Decay, Filling, Missing, 
+                Healthy_Periodontum, Gingivitis, Moderate_Periodontitis, Severe_Periodontitis)
+
+
+```
+
+```{r}
+### ===========================
+###   Periodontal Status Plot
+### ===========================
+
+# Transform the data for periodontal status plot
+perio_status_data_subset <- oral_status_data_subset %>% 
+  pivot_longer(
+    cols = c(Healthy_Periodontum, Gingivitis, Moderate_Periodontitis, Severe_Periodontitis),
+    names_to = "Variable", 
+    values_to = "Value"
+  )
+
+# Summarize the data
+perio_status_data_subset_df <- perio_status_data_subset %>%
+  group_by(Variable) %>%
+  summarise(Count = sum(Value),         # Count how many 1s are in each group
+            Total = n_distinct(SampleID),  # Count all distinct SampleIDs in each group
+            Percentage = (Count / Total) * 100)  # Calculate the percentage
+
+# Create labels for the plot
+perio_labels <- c("Healthy_Periodontum" = "Healthy Periodontum",
+                  "Gingivitis" = "Gingivitis",
+                  "Moderate_Periodontitis" = "Moderate Periodontitis",
+                  "Severe_Periodontitis" = "Severe Periodontitis")
+
+# Generate the periodontal status plot
+plot_perio <- perio_status_data_subset_df %>%
+  mutate(Variable = fct_relevel(Variable, "Severe_Periodontitis", "Moderate_Periodontitis", "Gingivitis", "Healthy_Periodontum")) %>%
+  ggplot(aes(x = Variable, y = Percentage)) +
+  geom_segment(aes(x = Variable, xend = Variable, y = 0, yend = Percentage), color = "#90b7eb", size = 1.5) +
+  geom_point(color = "#2b4adc", size = 5.5, alpha = 0.9) +
+  theme_boxplot() +
+  coord_flip() +  # Flip coordinates to have variables on the y-axis
+  scale_x_discrete(labels = perio_labels) +
+  labs(x = "Periodontal Status", y = "Cohort Percentage (%)") +
+  theme(
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_text(color = "black", angle = 0, hjust = 1, 
+                               margin = margin(t = 0, r = 0, b = 0, l = 0)),
+    axis.text.x = element_text(color = "black", angle = 0, hjust = 0.5, 
+                               margin = margin(t = 5, r = 0, b = 0, l = 0)),
+    axis.title.x = element_text(size = 15, margin = margin(t = 10, r = 0, b = 0, l = 0), color = "black"),
+    axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 0), color = "black", face = "bold")
+  )
+
+```
+
+```{r}
+### ===========================
+###   Extraoral Status Plot
+### ===========================
+
+# Transform the data for extraoral status plot
+extraoral_status_data_subset <- oral_status_data_subset %>% 
+  pivot_longer(
+    cols = c(Extraoral, N_Mucosa, ATM),
+    names_to = "Variable", 
+    values_to = "Value"
+  )
+
+# Summarize the data
+extraoral_status_data_subset_df <- extraoral_status_data_subset %>%
+  group_by(Variable) %>%
+  summarise(Count = sum(Value),         # Count how many 1s are in each group
+            Total = n_distinct(SampleID),  # Count all distinct SampleIDs in each group
+            Percentage = (Count / Total) * 100)  # Calculate the percentage
+
+# Create labels for the plot
+extraoral_labels <- c("N_Mucosa" = "Mucosa", "ATM" = "TMJ")
+
+# Generate the extraoral status plot
+plot_extraoral <- extraoral_status_data_subset_df %>%
+  mutate(Variable = fct_relevel(Variable, "ATM", "N_Mucosa", "Extraoral")) %>%
+  ggplot(aes(x = Variable, y = Percentage)) +
+  geom_segment(aes(x = Variable, xend = Variable, y = 0, yend = Percentage), color = "#90b7eb", size = 1.5) +
+  geom_point(color = "#2b4adc", size = 5.5, alpha = 0.9) +
+  theme_boxplot() +
+  coord_flip() +  # Flip coordinates to have variables on the y-axis
+  scale_x_discrete(labels = extraoral_labels) +
+  labs(x = "Lesions", y = "Cohort Percentage (%)") +
+  theme(
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_text(color = "black", angle = 0, hjust = 1, 
+                               margin = margin(t = 0, r = 0, b = 0, l = 0)),
+    axis.text.x = element_text(color = "black", angle = 0, hjust = 0.5, 
+                               margin = margin(t = 5, r = 0, b = 0, l = 0)),
+    axis.title.x = element_text(size = 15, margin = margin(t = 10, r = 0, b = 0, l = 0), color = "black"),
+    axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 0), color = "black", face = "bold")
+  )
+
+```
+
+```{r}
+### ===========================
+###   Dental Status Plot
+### ===========================
+
+# Prepare the dataset for the error bar plot
+s_CAO <- s_TG %>% 
+  subset(select = c(45:47)) %>% 
+  pivot_longer(
+    cols = c(Decay, Missing, Filling),
+    names_to = "Variable", 
+    values_to = "Value"
+  ) %>%
+  group_by(Variable) %>%
+  summarise(
+    Mean = mean(Value),          # Calculate the mean value
+    SE = sd(Value) / sqrt(n())  # Calculate the standard error
+  )
+
+# Generate the plot
+plot_CAO <- s_CAO %>%
+  ggplot(aes(x = Variable, y = Mean)) +
+  geom_bar(position = "dodge", stat = "identity", alpha = 0.7, color = "#2b4adc", size = 0.8, fill = "#90b7eb") +
+  geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), width = .15, position = position_dodge(0.7), size = 0.8, color = "#2b4adc") +
+  labs(x = "Dental Status", y = "Teeth Number", fill = "Menstrual Status") +
+  theme_boxplot() +
+  theme(
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(color = "black", angle = 0, hjust = 1, 
+                               margin = margin(t = 0, r = 5, b = 0, l = 0)),
+    axis.text.x = element_text(color = "black", angle = 0, hjust = 0.5, 
+                               margin = margin(t = 3, r = 0, b = 0, l = 0)),
+    axis.title.x = element_text(margin = margin(t = 10, r = 0, b = 0, l = 0), color = "black", face = "bold"),
+    axis.title.y = element_text(size = 15, margin = margin(t = 0, r = 10, b = 0, l = 0), color = "black")
+  )
+
+
+```
+
+```{r, fig.height= 8, fig.width= 7}
+### ===========================
+###   Combine Plots
+### ===========================
+
+# Combine the plots into one figure
+ggarrange(plot_extraoral, plot_perio, plot_CAO, 
+          ncol = 1, nrow = 3, 
+          common.legend = FALSE,
+          legend = "right")
+ggsave("F1BCD.pdf", plot = last_plot(), device = "pdf", width = 8, height = 7, units = "in")
+
+```
+
+
+## E) Salivary Flow
+```{r}
+### ===========================
+###   Data Preparation for Hormone Correlation Plots
+### ===========================
+
+# Filter and prepare the dataset for hormone correlation plots
+s_hormones <- s_niches %>%
+  filter(SampleType == "TG") %>%  # Use TG to have only one sample type, as saliva values are the same across sample types
+  dplyr::select(SampleID, Age, Menstrual_Status, Estradiol, Estrone, Saliva_ST, pH) %>%
+  mutate(Ratio = Estradiol / Estrone)  # Add a column for the ratio of Estradiol to Estrone
+
+```
+
+```{r}
+### ===========================
+###   Correlation Plot: Age vs Salivary Estradiol
+### ===========================
+
+# Plot Age vs Salivary Estradiol
+st_estradiol <- s_hormones %>%
+  ggplot(aes(x = Age, y = Estradiol, fill = Saliva_ST)) +
+  geom_point(size = 4, stroke = 1, shape = 21, alpha = 0.8) +
+  scale_fill_gradient2(midpoint = 1.5, low = "#ffa97a", mid = "white", high = "#018fe3", space = "Lab") +
+  labs(x = "Age", y = "Salivary Estradiol (pg/ml)", fill = "Salivary Flow") +
+  # Add a regression line for the entire dataset
+  stat_smooth(method = "lm", aes(group = 1), se = TRUE, fill = "lightgray", colour = "black", alpha = 0.2) +
+  # Add correlation statistics for the entire dataset
+  stat_cor(aes(group = 1, label = paste(..rr.label.., ..p.label.., sep = "~`,`~")), 
+           method = "pearson", label.x = 45) + 
+  theme_boxplot() +
+  theme(plot.title = element_text(hjust = 0.5, face = "plain"))
+
+print(st_estradiol)
+ggsave("F1E1.pdf", plot = last_plot(), device = "pdf", width = 4, height = 4, units = "in")
+```
+
+```{r}
+### ===========================
+###   Correlation Plot: Age vs Salivary Estrone
+### ===========================
+
+# Plot Age vs Salivary Estrone
+st_estrone <- s_hormones %>%
+  ggplot(aes(x = Age, y = Estrone, fill = Saliva_ST)) +
+  geom_point(size = 4, stroke = 1, shape = 21, alpha = 0.8) +
+  scale_fill_gradient2(midpoint = 1.5, low = "#ffa97a", mid = "white", high = "#018fe3", space = "Lab") +
+  labs(x = "Age", y = "Salivary Estrone (pg/ml)", fill = "Salivary Flow") +
+  # Add a regression line for the entire dataset
+  stat_smooth(method = "lm", aes(group = 1), se = TRUE, fill = "lightgray", colour = "black", alpha = 0.2) +
+  # Add correlation statistics for the entire dataset
+  stat_cor(aes(group = 1, label = paste(..rr.label.., ..p.label.., sep = "~`,`~")), 
+           method = "pearson", label.x = 45) + 
+  theme_boxplot() +
+  theme(plot.title = element_text(hjust = 0.5, face = "plain"))
+
+print(st_estrone)
+ggsave("F1E2.pdf", plot = last_plot(), device = "pdf", units = "in")
+```
+
+```{r}
+### ===========================
+###   Combine Correlation Plots
+### ===========================
+
+# Combine the plots into one figure
+ggarrange(st_estradiol, st_estrone, 
+          ncol = 2, nrow = 1, 
+          common.legend = TRUE,
+          legend = "bottom")
+ggsave("F1E.pdf", plot = last_plot(), device = "pdf", units = "in")
+
+```
+
+
+
+# FIGURE 2
+## A) Bacterial Composition
+```{r}
+### ===========================
+###   Data Transformation
+### ===========================
+
+# Use pivot_longer() to transform the dataframe from wide to long format
+assignment_counts_clean <- abundance_table_clean %>%
+  pivot_longer(
+    cols = -SampleID,  # Exclude the SampleID column to keep it as is
+    names_to = "TaxonLabel",  # This will be the new column with taxon names
+    values_to = "E_Proportion"  # This will be the new column with proportion values
+  )
+
+```
+
+```{r}
+### ===========================
+###   Data Preparation for Taxa Barplot
+### ===========================
+
+# Filter and prepare the taxa dataset
+taxa <- assignment_counts_clean %>%
+  filter(SampleID %in% s_niches$SampleID) %>%
+  mutate(Assignment = fct_lump(TaxonLabel, n = 19, w = E_Proportion)) %>%  # Lump less frequent taxa into 'Other'
+  # Normalize proportions after decontamination
+  group_by(SampleID) %>%
+  mutate(Proportion = E_Proportion / sum(E_Proportion)) %>%
+  ungroup() %>%
+  # Sum proportions within each sample
+  group_by(SampleID, Assignment) %>%
+  summarize(Proportion = sum(Proportion)) %>%
+  ungroup() %>%
+  # Join with metadata and calculate average proportions
+  left_join(s_niches, by="SampleID") %>%
+  group_by(SubjectID, SampleID, SampleType, Assignment, Menstrual_Status) %>%
+  summarize(Proportion = mean(Proportion)) %>%
+  ungroup() %>%
+  # Make the labels cleaner
+  mutate(TaxonLabel = str_remove(Assignment, "^\\w+ ")) %>%
+  mutate(Phylum = str_replace(Assignment, "^(\\w+)\\s.*", "\\1"))
+
+```
+
+```{r}
+### ===========================
+###   Define Sample Type Names
+### ===========================
+
+# Define new facet label names for sample type variable
+sampletype_names <- c(`BM` = "BM", `TG` = "TG", `TH` = "TH", `GM` = "GM")
+
+```
+
+```{r}
+### ===========================
+###   Clean Taxon Labels and Define Palette
+### ===========================
+
+# Clean specific taxon labels
+taxa$TaxonLabel <- sub(
+  "Saccharibacteria_\\(TM7\\) Saccharibacteria_\\(TM7\\)_\\[G-1\\]", 
+  "Saccharibacteria \\(TM7\\) \\[G-1\\]", 
+  taxa$TaxonLabel
+)
+
+# Define a custom color palette
+my_palette <- c(
+  "#1F77B4FF","#FF7F0EFF", "#2CA02CFF","#D62728FF", "#9467BDFF", 
+  "#8C564BFF","#E377C2FF", "#7F7F7FFF", "#BCBD22FF", "#17BECFFF",
+  "#AEC7E8FF", "#FFBB78FF", "#98DF8AFF","#FF9896FF",  "#C5B0D5FF",
+  "#C49C94FF", "#F7B6D2FF", "#DBDB8DFF", "#9EDAE5FF","#C7C7C7FF"
+)
+
+
+```
+
+```{r, fig.width=17, fig.height=8}
+### ===========================
+###   Barplot of Taxa
+### ===========================
+
+# Generate the barplot for taxa
+bacteria_plot <- taxa %>%
+  mutate(SampleType = fct_relevel(SampleType, "BM", "TG", "TH", "GM")) %>%  # Set the order of sample types
+  ggplot(aes(x = reorder(SampleID, Proportion, decreasing = F), y = Proportion)) +
+  geom_col(aes(fill = fct_relevel(TaxonLabel, "Other", after = Inf), width = 1)) +
+  scale_fill_manual(values = my_palette) +
+  labs(x="Sample", y= "Relative Abundance", fill= "Bacteria") +
+  theme_boxplot() +
+  facet_grid(~SampleType, scales = "free", labeller = as_labeller(sampletype_names)) +
+  theme_tufte(base_size = 24, base_family = "Arial") +
+  theme(
+    panel.spacing.x = unit(0.1, "lines"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(margin = margin(t = 0, r = 5, b = 0, l = 0)),
+    strip.text.x = element_text(size = 28, vjust = 0, hjust = 0.5, face = "bold", 
+                                margin = margin(t = 0, r = 0, b = 3, l = 0))
+    #strip.text.x = element_blank()
+  )
+
+bacteria_plot
+
+ggsave("F2A.eps", plot = last_plot(), device = "eps", width = 17, height = 8, units = "in")
+
+```
+
+```{r}
+### ===========================
+###   Data Preparation for Estrogen and Bacteria Plots
+### ===========================
+
+# Select relevant columns for estrogen data
+s_estrogen <- s_niches %>% 
+  dplyr::select("SampleID", "Estrone", "Estradiol", "SampleType")
+
+# Merge estrogen data with taxa data
+taxa_estrogen <- taxa  %>%
+  left_join(s_estrogen, by = "SampleID")
+
+```
+
+```{r}
+### ===========================
+###   Plotting Salivary Estrone Levels
+### ===========================
+
+# Plot salivary estrone levels
+estrone_plot <- s_estrogen %>%
+  mutate(SampleType = fct_relevel(SampleType, "BM", "TG", "TH", "GM")) %>%
+  ggplot(aes(x = SampleID, y = Estrone)) +
+  geom_col(fill = "white", colour = "black") +
+  labs(y = "Salivary\nEstrone", x = NULL) +
+  facet_grid(~SampleType, scales = "free", labeller = as_labeller(sampletype_names)) +
+  theme_tufte(base_size = 20, base_family = "Arial") +
+  theme(
+    panel.spacing.x = unit(0.1, "lines"),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.y = element_text(margin = margin(t = 0, r = 0, b = 0, l = 0)),
+    strip.text.x = element_blank()
+  )
+
+print(estrone_plot)
+
+```
+
+```{r}
+### ===========================
+###   Plotting Salivary Estradiol Levels
+### ===========================
+
+# Plot salivary estradiol levels
+estradiol_plot <- s_estrogen %>%
+  mutate(SampleType = fct_relevel(SampleType, "BM", "TG", "TH", "GM")) %>%
+  ggplot(aes(x = SampleID, y = Estradiol)) +
+  geom_col(fill = "white", colour = "black") +
+  labs(y = "Salivary\nEstradiol", x = NULL) +
+  facet_grid(~SampleType, scales = "free", labeller = as_labeller(sampletype_names)) +
+  theme_tufte(base_size = 20, base_family = "Arial") +
+  theme(
+    panel.spacing.x = unit(0.1, "lines"),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.y = element_text(margin = margin(t = 0, r = 0, b = 0, l = 0)),
+    strip.text.x = element_text(size = 28, vjust = 0, hjust = 0.5, face = "bold", margin = margin(t = 0, r = 0, b = 5, l = 0))
+  )
+
+print(estradiol_plot)
+
+```
+
+```{r, fig.width=17, fig.height=8}
+### ===========================
+###   Combining Plots with Patchwork
+### ===========================
+
+# Load the patchwork library
+library(patchwork)
+
+# Combine the plots into one figure
+combined_plot <- estradiol_plot / estrone_plot / bacteria_plot +
+  plot_layout(guides = 'collect') & theme(plot.margin = unit(c(0, 0, 0, 0), "lines"))
+
+# Adjust the layout heights
+combined_plot + plot_layout(heights = c(1, 1, 5))
+
+```
+
+### Stats
+```{r}
+### ===========================
+###   Statistical Analysis of Taxa
+### ===========================
+
+# Load necessary libraries
+library(purrr)
+
+# Define microorganisms of interest
+microorganism <- c("Capnocytophaga", "Haemophilus", "Leptotrichia", "Neisseria", "Prevotella", "Saccharibacteria (TM7) [G-1]", "Streptococcus")
+
+# Calculate mean and standard deviation for each microorganism in each sample type
+taxa_mean <- map_df(microorganism, ~taxa %>%
+                      filter(TaxonLabel == .x) %>%
+                      group_by(SampleType, TaxonLabel) %>%
+                      summarise(Media = mean(Proportion),
+                                Sd = sd(Proportion),
+                                .groups = 'drop'))
+
+# Display the mean and standard deviation results
+print(taxa_mean)
+
+# Calculate median and interquartile range (IQR) for each microorganism in each sample type
+taxa_median <- map_df(microorganism, ~taxa %>%
+                        filter(TaxonLabel == .x) %>%
+                        group_by(SampleType, TaxonLabel) %>%
+                        summarise(Mediana = median(Proportion),
+                                  IQR = IQR(Proportion),
+                                  .groups = 'drop'))
+
+# Display the median and IQR results
+print(taxa_median)
+
+# Filter data to include only microorganisms of interest
+filtered_data <- taxa %>%
+  filter(TaxonLabel %in% microorganism)
+
+# Calculate the total proportion sum for each sample type
+total_proportions <- filtered_data %>%
+  group_by(SampleType) %>%
+  summarise(TotalProportion = sum(Proportion), .groups = 'drop')
+
+# Calculate the percentage of each bacterium by SampleType
+percentage_data <- filtered_data %>%
+  left_join(total_proportions, by = "SampleType") %>%
+  mutate(Percentage = (Proportion / TotalProportion) * 100) %>%
+  dplyr::select(SampleType, TaxonLabel, Percentage)
+
+# Group and summarize the data to get percentages by bacterium and sample type
+bacteria_percentage_by_sampletype <- percentage_data %>%
+  group_by(SampleType, TaxonLabel) %>%
+  summarise(MeanPercentage = mean(Percentage), .groups = 'drop')
+
+# Display the percentage results
+print(bacteria_percentage_by_sampletype)
+
+```
+
+```{r}
+# Write data to a TSV file
+write.table(taxa_mean, 
+            "taxa_mean_sd.tsv", 
+            sep = "\t", 
+            row.names = FALSE, 
+            quote = FALSE)
+```
+
+
+## B) Beta Diversity
+```{r}
+### ===========================
+###   Read in beta diversity
+### ===========================
+
+# Read the Bray-Curtis dissimilarity matrix
+bc <- read_qiime_distmat(bc_fp)
+
+```
+
+```{r}
+### ===========================
+###   PCoA Analysis
+### ===========================
+
+# Subset the Bray-Curtis dissimilarity matrix to include only relevant samples
+bc_niches <- dist_subset(bc, s_niches$SampleID)
+
+# Perform Principal Coordinates Analysis (PCoA)
+pc <- pcoa(bc_niches)
+
+# Calculate the percentage of variation explained by each axis
+pctvar <- round(pc$values$Relative_eig * 100)
+
+# Get principal coordinate positions of samples
+s_coords <- pc$vectors %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  dplyr::select(1:4)
+
+```
+
+```{r}
+### ===========================
+###   Calculate and Plot Centroids
+### ===========================
+
+# Define colors for sample types
+cols_type <- c("TH"="#67b3e5", "GM"="#b4db94", "BM"= "#ec729b", "TG"="#fdb95e")
+
+# Calculate centroids for each SampleType
+centroids <- s_niches %>%
+  mutate(SampleType = fct_relevel(SampleType, "BM","TG","TH","GM")) %>%
+  left_join(s_coords, by = "SampleID") %>%
+  group_by(SampleType) %>%
+  summarise_at(vars(Axis.1, Axis.2), mean, na.rm = TRUE)
+
+# Plot PCoA with centroids
+s_niches %>%
+  mutate(SampleType = fct_relevel(SampleType, "BM","TG","TH","GM")) %>%
+  left_join(s_coords, by = "SampleID") %>%
+  ggplot(aes(x = Axis.1, y = Axis.2)) +
+  geom_point(aes(fill = SampleType, colour = SampleType), shape = 21, alpha = 0.85, stroke = 1, size = 4) +
+  scale_fill_manual(values = cols_type, name = "Oral niches", labels = sampletype_names) +
+  scale_colour_manual(values = cols_type, name = "Oral niches", labels = sampletype_names) +
+  geom_text_repel(data = centroids, aes(label = sampletype_names), fontface = 'bold.italic', size = 7, segment.size = 0) +
+  labs(x = paste0("PC1 (", pctvar[1], "%)"), y = paste0("PC2 (", pctvar[2], "%)")) +
+  theme_boxplot() + 
+  theme(text = element_text(size = 18),
+        axis.title.y = element_text(face = "plain"),
+        axis.title.x = element_text(face = "plain"),
+        legend.title = element_text(face = "bold", size = 18),
+        legend.text = element_text(size = 15, margin = margin(t = 0, r = 0, b = 0, l = 0)),
+        legend.position = "right") +
+  guides(fill = guide_legend(override.aes = list(shape = 21, stroke = 1)))
+
+ggsave("F2B.pdf", plot = last_plot(), device = "pdf", units = "in")
+```
+
+### Stats
+```{r}
+### ===========================
+###   Statistical Analysis: PERMANOVA
+### ===========================
+
+# Perform PERMANOVA
+niches.perm <- permanova_pairwise(bc_niches, s_niches$SampleType, permutations = 999, method = "bray", padj = "BH")
+
+# Prepare data for plotting
+plot_niches.perm <- niches.perm %>%
+  dplyr::select(pairs, p.adj) %>%
+  separate(pairs, into = c("pair1", "pair2"), sep = " vs ")
+
+# Plot PERMANOVA results
+plot_niches.perm %>%
+  ggplot(aes(x = pair2, y = pair1)) +
+  geom_tile(color = "black", fill = "white", size = 0.8) + 
+  geom_text(aes(label = sprintf("%.2e", p.adj), color = p.adj < 0.05), size = 9) + 
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) + 
+  theme_boxplot() + 
+  theme(text = element_text(size = 30),
+        axis.text.x = element_text(hjust = 0.5, colour = "black"),
+        axis.text.y = element_text(vjust = 0.5, colour = "black"),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "none") + 
+  labs(x = "p adj. value table", y = "")
+
+```
+
+
+## C) Alpha Diversity
+```{r}
+### ===========================
+###   Calculate / Read in Alpha Diversity
+### ===========================
+
+# Read the Faith's Phylogenetic Diversity (PD) data
+faith_df <- read_tsv(file = faith_fp) %>%
+  rename(SampleID = "#SampleID")
+
+# Calculate alpha diversity metrics and merge with Faith's PD data
+alpha_df <- otu_counts %>%
+  group_by(SampleID) %>%
+  summarize(
+    Shannon = diversity(Counts, index = "shannon"),  # Shannon diversity index
+    Simpson = diversity(Counts, index = "simpson"),  # Simpson diversity index
+    Richness = specnumber(Counts),  # Species richness
+    Inv_simpson = 1 / Simpson  # Inverse Simpson index
+  ) %>%
+  left_join(faith_df, by = "SampleID")  # Merge with Faith's PD data
+
+```
+
+```{r}
+### ===========================
+###   Merge Alpha Diversity Data
+### ===========================
+
+# Merge calculated alpha diversity metrics with sample metadata
+alpha <- s_niches %>%
+  left_join(alpha_df, by = "SampleID")
+
+```
+
+```{r}
+### ===========================
+###   Plotting Alpha Diversity Metrics
+### ===========================
+
+# Plot Shannon Diversity Index
+shannon_plot <- alpha %>%
+  mutate(SampleType = fct_relevel(SampleType, "BM", "TG", "TH", "GM")) %>%  # Reorder sample types
+  ggplot(aes(x = SampleType, y = Shannon)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_beeswarm(aes(color = SampleType), alpha = 0.5, size = 2.5) +
+  scale_color_manual(values = cols_type, guide = FALSE) +
+  scale_x_discrete(labels = sampletype_names) +
+  labs(x = "", y = "Shannon", title = "Diversity") +
+  theme_boxplot() +
+  theme(text = element_text(size = 18), plot.title = element_text(hjust = 0.5, size = 17))
+
+# Display the Shannon plot
+shannon_plot
+
+```
+
+```{r}
+# Plot Species Richness
+richness_plot <- alpha %>%
+  mutate(SampleType = fct_relevel(SampleType, "BM", "TG", "TH", "GM")) %>%  # Reorder sample types
+  ggplot(aes(x = SampleType, y = Richness)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_beeswarm(aes(color = SampleType), alpha = 0.5, size = 2.5) +
+  scale_color_manual(values = cols_type, guide = FALSE) +
+  scale_x_discrete(labels = sampletype_names) +
+  labs(x = "", y = "Richness", title = "Richness") +
+  theme_boxplot() +
+  theme(text = element_text(size = 18), plot.title = element_text(hjust = 0.5, size = 17))
+
+# Display the Richness plot
+richness_plot
+
+```
+
+```{r, fig.height=4, fig.width=8}
+# Arrange the Shannon and Richness plots side by side
+ggarrange(shannon_plot, richness_plot,
+          ncol = 2, nrow = 1, 
+          common.legend = TRUE,
+          legend = "bottom") +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.1)) +
+  theme(plot.margin = margin(10, 20, 0, 10))
+
+ggsave("F2C.pdf", plot = last_plot(), device = "pdf",  width = 8, height = 4, units = "in")
+```
+
+### Stats
+```{r}
+### ===========================
+###   Statistical Comparisons for Alpha Diversity
+### ===========================
+
+# Perform Wilcoxon tests for Shannon diversity
+shannon_alpha <- compare_means(Shannon ~ SampleType, data = alpha,
+                               method = "wilcox.test", p.adjust.method = "BH")
+
+# Perform Wilcoxon tests for Richness
+richness_alpha <- compare_means(Richness ~ SampleType, data = alpha,
+                                method = "wilcox.test", p.adjust.method = "BH")
+
+```
+
+```{r}
+### ===========================
+###   Plotting Statistical Comparisons for Alpha Diversity
+### ===========================
+
+# Plotdiversity comparisons
+shannon_alpha %>%
+  ggplot(aes(x = group2, y = group1)) +
+  geom_tile(color = "black", fill = "white", size = 0.8) +  # Create a tile plot with black borders and white fill
+  geom_text(aes(label = sprintf("%.2e", p.adj), color = p.adj < 0.05), size = 6) +  # Add text with conditional coloring based on significance
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +  # Conditional text colors
+  theme_minimal() +  # Minimalist theme
+  theme(
+    text = element_text(size = 22),
+    axis.text.x = element_text(hjust = 0.5, colour = "black"),  # Center X-axis labels
+    axis.text.y = element_text(vjust = 0.5, colour = "black"),  # Center Y-axis labels
+    axis.title.x = element_text(margin = margin(t = 10)),  
+    panel.grid.major = element_blank(),  # Hide major grid lines
+    panel.grid.minor = element_blank(),  # Hide minor grid lines
+    legend.position = "none"  # Remove legend
+  ) +
+  labs(x = "Richness\np adj. value table", y = "")  # Customize axis labels
+
+```
+
+
+## D) Niche Overlap Analysis
+```{r}
+### ===========================
+###   Niche Overlap Analysis
+### ===========================
+
+# Load necessary libraries
+library(indicspecies)
+library(multtest)  # For p-value adjustment
+library(ComplexUpset) 
+
+# Filter abundance table to remove control samples
+abundance_table_niche_overlap <- abundance_table_clean %>% 
+  filter(!SampleID %in% c("CTL22ABRIL", "CTL30JUNIO", "CTL7FEBRERO"))
+
+# Prepare abundance table for analysis
+SampleID <- abundance_table_niche_overlap$SampleID
+abundance_table_niche_overlap <- abundance_table_niche_overlap %>%
+  dplyr::select(-SampleID)
+rownames(abundance_table_niche_overlap) <- SampleID
+
+# Prepare metadata for analysis
+metadata_niche_overlap <- s_niches %>%
+  dplyr::select(SampleID, SampleType)
+SampleID <- metadata_niche_overlap$SampleID
+metadata_niche_overlap <- metadata_niche_overlap %>%
+  dplyr::select(-SampleID)
+rownames(metadata_niche_overlap) <- SampleID
+
+# Perform the indicator species analysis with permutations
+result <- multipatt(abundance_table_niche_overlap, 
+                    metadata_niche_overlap$SampleType, 
+                    func = "IndVal.g", 
+                    control = how(nperm = 999))
+
+# Display summary of results
+summary(result)
+
+# Adjust p-values using Benjamini-Hochberg method
+result$sign$p.adjust <- p.adjust(result$sign$p.value, method = "BH")
+
+# Extract significant species
+significant_species <- result$sign[!is.na(result$sign$p.adjust) & result$sign$p.adjust < 0.05, ]
+
+
+```
+
+```{r}
+# Write data to a TSV file
+write.table(significant_species, 
+            "Stats/Stats_Niche_Overlap.tsv", 
+            sep = "\t", 
+            row.names = FALSE, 
+            quote = FALSE)
+```
+
+```{r}
+### ===========================
+###   Visualization with UpSet Plot
+### ===========================
+
+# Prepare data for UpSet Plot
+binary_matrix <- significant_species[, c("s.BM", "s.GM", "s.TG", "s.TH")]
+binary_matrix <- as.data.frame(binary_matrix)
+binary_matrix <- binary_matrix %>%
+  rename(BM = "s.BM", GM = "s.GM", TG = "s.TG", TH = "s.TH")
+Upset_matrix <- binary_matrix
+
+```
+
+#### Plot
+Web tutorial for Upset Plot
+https://krassowski.github.io/complex-upset/articles/Examples_R.html
+```{r}
+# UpSet Plot
+ComplexUpset::upset(
+  as.data.frame(Upset_matrix),
+  c("BM", "TG", "TH", "GM"),
+  width_ratio = 0.2,
+  name = "Sample Type",
+  base_annotations = list(
+    'Intersection size' = (
+      intersection_size(
+        counts = FALSE,
+        #text_colors = c(on_background = "black", on_bar = "black"),
+        mapping = aes(fill = 'bars_color', color = 'bars_color')
+      ) + 
+      scale_fill_manual(values = c('bars_color' = 'white'), guide = 'none') +
+      scale_color_manual(values = c('bars_color' = 'black'), guide = 'none') +
+      theme(
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        text = element_text(size = 12, color="black"),
+        axis.text.y = element_text(color="black"),
+      ) +
+      scale_y_continuous(breaks = seq(0, 10, by = 1))
+    )
+  ),
+  queries = list(
+    upset_query(intersect = "TG", color = '#fdb95e'),
+    upset_query(intersect = "TH", color = '#67b3e5'),
+    upset_query(intersect = "GM", color = '#b4db94'),
+    upset_query(set = 'BM', fill = '#ec729b'),
+    upset_query(set = 'TG', fill = '#fdb95e'),
+    upset_query(set = 'TH', fill = '#67b3e5'),
+    upset_query(set = 'GM', fill = '#b4db94')
+  )
+)
+  
+ggsave("F2D.pdf", plot = last_plot(), device = "pdf",  width = 7, height = 5, units = "in")
+
+```
+
+
+
+# FIGURE 3
+## A) Simpson - Estrogen
+```{r}
+### ===========================
+###   Simpson Diversity vs. Estrogen
+### ===========================
+
+# Simpson - Estradiol
+s_niches %>%
+  mutate(SampleType = fct_relevel(SampleType, "BM","TG","TH","GM")) %>%
+  left_join(alpha_df, by = "SampleID") %>%
+  ggplot(aes(x = Estradiol, y = Simpson, color = SampleType)) +
+  geom_point(fill = NA, size = 3, shape = 19, stroke = 0.5) + 
+  scale_color_manual(values = cols_type, labels = sampletype_names) +  
+  labs(x = "Salivary Estradiol (pg/ml)", y = "Simpson",
+       color = "Sample types") +
+  # Add regression lines for each group of SampleType
+  stat_smooth(method = "lm", aes(group = SampleType), 
+              se = TRUE, fill = "lightgray", alpha = 0.2, linewidth = 0.5) +
+  # Add correlation statistics for each group
+  stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")), 
+           method = "pearson", label.x = 1, label.y = 0.90, size = 3) +
+  facet_wrap(~SampleType, scales = "fixed", 
+             labeller = as_labeller(sampletype_names)) +
+  theme_boxplot() +
+  ggtitle("Estradiol") + 
+  theme(
+    text = element_text(size = 12),
+    strip.text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5, size = 13),
+    axis.ticks = element_line(size = 0.4))
+
+ggsave("F3A.pdf", plot = last_plot(), device = "pdf", width = 8, height = 6, units = "in")
+
+```
+
+```{r}
+# Simpson - Estrone
+s_niches %>%
+  mutate(SampleType = fct_relevel(SampleType, "BM","TG","TH","GM")) %>%
+  left_join(alpha_df, by = "SampleID") %>%
+  ggplot(aes(x = Estrone, y = Simpson, color = SampleType)) +
+  geom_point(fill = NA, size = 3, shape = 19, stroke = 0.5) + 
+  scale_color_manual(values = cols_type, labels = sampletype_names) +  
+  labs(x = "Salivary Estrone (pg/ml)", y = "Simpson",
+       color = "Sample types") +
+  # Add regression lines for each group of SampleType
+  stat_smooth(method = "lm", aes(group = SampleType), 
+              se = TRUE, fill = "lightgray", alpha = 0.2, linewidth = 0.5) +
+  # Add correlation statistics for each group
+  stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")), 
+           method = "pearson", label.x = 10, label.y = 0.90, size = 3) +
+  facet_wrap(~SampleType, scales = "fixed", 
+             labeller = as_labeller(sampletype_names)) +
+  theme_boxplot() +
+  ggtitle("Estrone") + 
+  theme(
+    text = element_text(size = 12),
+    strip.text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5, size = 13),
+    axis.ticks = element_line(size = 0.4))
+
+ggsave("F3B.pdf", plot = last_plot(), device = "pdf", width = 8, height = 6, units = "in")
+```
+
+
+## B) CCA
+```{r}
+### ===========================
+###   Data Preparation
+### ===========================
+
+# Select relevant columns for CCA
+cca_estrogen_data <- s_niches %>%
+  dplyr::select(SampleID, SampleType, Estradiol, Estrone)
+rownames(cca_estrogen_data) <- s_niches$SampleID
+
+# Calculate the median of the Estrone column, excluding NAs
+median_estrone <- median(cca_estrogen_data$Estrone, na.rm = TRUE)
+# Replace NAs in the Estrone column with the median
+cca_estrogen_data$Estrone[is.na(cca_estrogen_data$Estrone)] <- median_estrone
+
+# Calculate the median of the Estradiol column, excluding NAs
+median_estradiol <- median(cca_estrogen_data$Estradiol, na.rm = TRUE)
+# Replace NAs in the Estradiol column with the median
+cca_estrogen_data$Estradiol[is.na(cca_estrogen_data$Estradiol)] <- median_estradiol
+
+# Filter out specific samples from the abundance table
+cca_abundance_table <- abundance_table_clean %>% 
+  filter(!SampleID %in% c("CTL22ABRIL", "CTL30JUNIO", "CTL7FEBRERO"))
+SampleID <- cca_abundance_table$SampleID
+cca_abundance_table <- cca_abundance_table %>%
+  dplyr::select(-SampleID)
+rownames(cca_abundance_table) <- SampleID
+
+
+```
+
+```{r}
+### ===========================
+###   Fit and Visualize the CCA Model
+### ===========================
+
+# Fit the CCA model to assess the influence of Estradiol and Estrone on the microbial community composition
+cca_model <- cca(cca_abundance_table ~ Estradiol + Estrone, data = cca_estrogen_data)
+# Display the summary of the CCA model
+summary(cca_model)
+# Create a biplot of the CCA results
+plot(cca_model)
+
+```
+
+### Stats
+```{r}
+# Permutation test to evaluate the significance of the canonical axes
+permutation_test <- anova(cca_model, permutations = 999)
+print(permutation_test)
+
+```
+
+```{r}
+# PERMANOVA analyses to evaluate the interaction and individual effects
+permanova_interaccion <- adonis2(cca_abundance_table ~ Estradiol * Estrone, data = cca_estrogen_data, method = "euclidean")
+permanova_estradiol <- adonis2(cca_abundance_table ~ Estradiol, data = cca_estrogen_data, method = "bray")
+permanova_estrona <- adonis2(cca_abundance_table ~ Estrone, data = cca_estrogen_data, method = "bray")
+
+# Print PERMANOVA results
+print(permanova_interaccion)
+print(permanova_estradiol)
+print(permanova_estrona)
+
+
+```
+
+```{r}
+### ===========================
+###   CCA Biplot Visualization
+### ===========================
+
+# Extract scores from the CCA model
+scores <- as.data.frame(scores(cca_model, display = "sites"))
+cca_estrogen_data <- cbind(cca_estrogen_data, scores)
+
+# Define the coordinates obtained from the CCA model for Estradiol and Estrone
+variables <- data.frame(
+  variable = c("Estradiol", "Estrone"),
+  CCA1 = c(0.3034, -0.9529),  # Replace these values with the actual CCA1 scores
+  CCA2 = c(-0.8739, -0.4861)  # Replace these values with the actual CCA2 scores
+)
+
+# Define a scaling factor for arrow length
+scale_factor <- 5
+
+# Create the CCA biplot
+cca_estrogen_data %>%
+  mutate(SampleType = fct_relevel(SampleType, "BM","TG","TH","GM")) %>%
+  ggplot(aes(x = CCA1, y = CCA2, color = factor(SampleType))) +
+  geom_point(alpha = 0.85, stroke = 1, size = 3) + 
+  scale_colour_manual(values = cols_type, name = "Oral niches", labels = sampletype_names) +
+  labs(x = "CCA1", y = "CCA2", color = "Sample Type") +
+  geom_segment(data = variables, aes(x = 0, y = 0, xend = CCA1 * scale_factor, yend = CCA2 * scale_factor), arrow = arrow(length = unit(0.3, "cm"), type = "closed"), color = "black", size = 0.5) +
+  geom_text(data = variables, aes(x = CCA1 * scale_factor, y = CCA2 * scale_factor, label = variable), color = "black", fontface = "bold.italic", size = 5.5, hjust = 0.6, vjust = 1.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +  # Vertical dashed line at x = 0
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Horizontal dashed line at y = 0
+  theme_boxplot() +
+  theme(
+    text = element_text(size = 18),
+    axis.title.y = element_text(face = "plain"),
+    axis.title.x = element_text(face = "plain"),
+    legend.title = element_text(face = "bold", size = 18),
+    legend.text = element_text(size = 15, margin = margin(t = 0, r = 0, b = 0, l = 0)),
+    legend.position = "right"
+  ) +
+  guides(fill = guide_legend(override.aes = list(shape = 21, stroke = 1)))
+
+ggsave("F3C.pdf", plot = last_plot(), device = "pdf", width = 8, height = 6, units = "in")
+```
+
+
+## C) MaAsLin2
+```{r}
+### ===========================
+###   MaAsLin2 Analysis Setup
+### ===========================
+
+# Prepare metadata for MaAsLin2
+maaslin2_metadata <- cca_estrogen_data %>%
+# Change the SampleType for each MaAsLin2 analysis. We run each analysis separately to see the effect of hormones in each niche.
+  filter(SampleType == "GM") %>%  
+  dplyr::select(SampleID, SampleType, Estradiol, Estrone)
+rownames(maaslin2_metadata) <- maaslin2_metadata$SampleID
+maaslin2_metadata <- maaslin2_metadata %>% dplyr::select(-SampleID)
+
+# Prepare abundance table for MaAsLin2
+maaslin2_abundance_table <- abundance_table_clean %>% 
+  filter(!SampleID %in% c("CTL22ABRIL", "CTL30JUNIO", "CTL7FEBRERO"))
+maaslin2_abundance_table <- maaslin2_abundance_table[grepl("_GM", maaslin2_abundance_table$SampleID), ] # Select specific SampleType
+SampleID <- maaslin2_abundance_table$SampleID
+maaslin2_abundance_table <- maaslin2_abundance_table %>%
+  dplyr::select(-SampleID)
+rownames(maaslin2_abundance_table) <- SampleID
+
+
+```
+
+```{r eval=FALSE, include=FALSE}
+### ===========================
+###   MaAsLin2 Analysis Execution
+### ===========================
+
+# Load necessary libraries
+library(Maaslin2)
+
+# Run MaAsLin2 
+Maaslin2(
+    input_data = maaslin2_abundance_table,       
+    input_metadata = maaslin2_metadata,          
+    output = "MaAslin_results_estrogen_GM/",  # change the folder containing the results
+    min_abundance = 0, 
+    min_prevalence = 0.1, 
+    min_variance = 0,
+    normalization = "TSS",
+    transform = "LOG",
+    analysis_method = "LM",  # consider using "CPLM" (Compound Poisson Linear Model) if you have zero-inflated data.
+    max_significance = 0.25,
+    random_effects = NULL,
+    fixed_effects = c("Estradiol", "Estrone"),
+    correction = "BH",
+    standardize = FALSE,
+    cores = 4,
+    plot_heatmap = TRUE,
+    plot_scatter = TRUE,
+    heatmap_first_n = 50,
+    reference = ""
+)
+
+```
+
+### Plot Results
+```{r}
+### ===========================
+###   Results for TH
+### ===========================
+
+## Read the results of the folder generated in MaAsLin2 analysis
+results <- read_tsv("MaAslin_results_estrogen_TH/all_results.tsv")
+
+# Customize feature names
+results$feature <- sub("Gracilibacteria_.GN02..Gracilibacteria_.GN02._.G.1.", "Gracilibacteria_.GN02._.G.1.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.6.", "Saccharibacteria_.TM7._.G.6.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.2.", "Saccharibacteria_.TM7._.G.2.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.5.", "Saccharibacteria_.TM7._.G.5.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.1.", "Saccharibacteria_.TM7._.G.1.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.3.", "Saccharibacteria_.TM7._.G.3.", results$feature)
+results$feature <- sub("Absconditabacteria_.SR1..Absconditabacteria_.SR1._.G.1.", "Absconditabacteria_.SR1._.G.1.", results$feature)
+
+results$feature <- sub("_.", " (", results$feature)
+results$feature <- sub("._", ") ", results$feature)
+results$feature <- sub("G.6.", "[G.6]", results$feature)
+results$feature <- sub("G.5.", "[G.5]", results$feature)
+results$feature <- sub("G.1.", "[G.1]", results$feature)
+results$feature <- sub("G.3.", "[G.3]", results$feature)
+results$feature <- sub("\\(\\[", "[", results$feature)
+results$feature <- sub("\\.\\[", "[", results$feature)
+results$feature <- sub("\\(G.2.", "(G.2)", results$feature)
+results$feature <- sub("\\(G.7.", "(G.7)", results$feature)
+results$feature <- sub("\\(G.4.", "(G.4)", results$feature)
+results$feature <- sub("\\(G.8.", "(G.8)", results$feature)
+results$feature <- sub("\\(G.9.", "(G.9)", results$feature)
+results$feature <- sub("\\.", "-", results$feature)
+
+results_TH <- results
+results_TH$SampleType <- "TH"
+
+```
+
+```{r}
+### ===========================
+###   Results for GM
+### ===========================
+
+## Read the results of the folder generated in MaAsLin2 analysis
+results <- read_tsv("MaAslin_results_estrogen_GM/all_results.tsv")
+
+# Customize feature names
+results$feature <- sub("Gracilibacteria_.GN02..Gracilibacteria_.GN02._.G.1.", "Gracilibacteria_.GN02._.G.1.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.6.", "Saccharibacteria_.TM7._.G.6.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.2.", "Saccharibacteria_.TM7._.G.2.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.5.", "Saccharibacteria_.TM7._.G.5.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.1.", "Saccharibacteria_.TM7._.G.1.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.3.", "Saccharibacteria_.TM7._.G.3.", results$feature)
+results$feature <- sub("Absconditabacteria_.SR1..Absconditabacteria_.SR1._.G.1.", "Absconditabacteria_.SR1._.G.1.", results$feature)
+
+results$feature <- sub("_.", " (", results$feature)
+results$feature <- sub("._", ") ", results$feature)
+results$feature <- sub("G.6.", "[G.6]", results$feature)
+results$feature <- sub("G.5.", "[G.5]", results$feature)
+results$feature <- sub("G.1.", "[G.1]", results$feature)
+results$feature <- sub("G.3.", "[G.3]", results$feature)
+results$feature <- sub("\\(\\[", "[", results$feature)
+results$feature <- sub("\\.\\[", "[", results$feature)
+results$feature <- sub("\\(G.2.", "(G.2)", results$feature)
+results$feature <- sub("\\(G.7.", "(G.7)", results$feature)
+results$feature <- sub("\\(G.4.", "(G.4)", results$feature)
+results$feature <- sub("\\(G.8.", "(G.8)", results$feature)
+results$feature <- sub("\\(G.9.", "(G.9)", results$feature)
+results$feature <- sub("\\.", "-", results$feature)
+
+results_GM <- results
+results_GM$SampleType <- "GM"
+
+```
+
+```{r}
+### ===========================
+###   Results for BM
+### ===========================
+
+## Read the results of the folder generated in MaAsLin2 analysis
+results <- read_tsv("MaAslin_results_estrogen_BM/all_results.tsv")
+
+# Customize feature names
+results$feature <- sub("Gracilibacteria_.GN02..Gracilibacteria_.GN02._.G.1.", "Gracilibacteria_.GN02._.G.1.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.6.", "Saccharibacteria_.TM7._.G.6.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.2.", "Saccharibacteria_.TM7._.G.2.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.5.", "Saccharibacteria_.TM7._.G.5.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.1.", "Saccharibacteria_.TM7._.G.1.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.3.", "Saccharibacteria_.TM7._.G.3.", results$feature)
+results$feature <- sub("Absconditabacteria_.SR1..Absconditabacteria_.SR1._.G.1.", "Absconditabacteria_.SR1._.G.1.", results$feature)
+
+results$feature <- sub("_.", " (", results$feature)
+results$feature <- sub("._", ") ", results$feature)
+results$feature <- sub("G.6.", "[G.6]", results$feature)
+results$feature <- sub("G.5.", "[G.5]", results$feature)
+results$feature <- sub("G.1.", "[G.1]", results$feature)
+results$feature <- sub("G.3.", "[G.3]", results$feature)
+results$feature <- sub("\\(\\[", "[", results$feature)
+results$feature <- sub("\\.\\[", "[", results$feature)
+results$feature <- sub("\\(G.2.", "(G.2)", results$feature)
+results$feature <- sub("\\(G.7.", "(G.7)", results$feature)
+results$feature <- sub("\\(G.4.", "(G.4)", results$feature)
+results$feature <- sub("\\(G.8.", "(G.8)", results$feature)
+results$feature <- sub("\\(G.9.", "(G.9)", results$feature)
+results$feature <- sub("\\.", "-", results$feature)
+
+results_BM <- results
+results_BM$SampleType <- "BM"
+
+```
+
+```{r}
+### ===========================
+###   Results for TG
+### ===========================
+
+## Read the results of the folder generated in MaAsLin2 analysis
+results <- read_tsv("MaAslin_results_estrogen_TG/all_results.tsv")
+
+# Customize feature names
+results$feature <- sub("Gracilibacteria_.GN02..Gracilibacteria_.GN02._.G.1.", "Gracilibacteria_.GN02._.G.1.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.6.", "Saccharibacteria_.TM7._.G.6.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.2.", "Saccharibacteria_.TM7._.G.2.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.5.", "Saccharibacteria_.TM7._.G.5.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.1.", "Saccharibacteria_.TM7._.G.1.", results$feature)
+results$feature <- sub("Saccharibacteria_.TM7..Saccharibacteria_.TM7._.G.3.", "Saccharibacteria_.TM7._.G.3.", results$feature)
+results$feature <- sub("Absconditabacteria_.SR1..Absconditabacteria_.SR1._.G.1.", "Absconditabacteria_.SR1._.G.1.", results$feature)
+
+results$feature <- sub("_.", " (", results$feature)
+results$feature <- sub("._", ") ", results$feature)
+results$feature <- sub("G.6.", "[G.6]", results$feature)
+results$feature <- sub("G.5.", "[G.5]", results$feature)
+results$feature <- sub("G.1.", "[G.1]", results$feature)
+results$feature <- sub("G.3.", "[G.3]", results$feature)
+results$feature <- sub("\\(\\[", "[", results$feature)
+results$feature <- sub("\\.\\[", "[", results$feature)
+results$feature <- sub("\\(G.2.", "(G.2)", results$feature)
+results$feature <- sub("\\(G.7.", "(G.7)", results$feature)
+results$feature <- sub("\\(G.4.", "(G.4)", results$feature)
+results$feature <- sub("\\(G.8.", "(G.8)", results$feature)
+results$feature <- sub("\\(G.9.", "(G.9)", results$feature)
+results$feature <- sub("\\.", "-", results$feature)
+
+results_TG <- results
+results_TG$SampleType <- "TG"
+
+```
+
+```{r, fig.width=7, fig.height=12}
+### ===========================
+###   Combining and Visualizing Results for All Niches
+### ===========================
+
+## Combine all niches results
+all_niches_results <- results_BM %>%
+  full_join(results_GM) %>%
+  full_join(results_TG) %>%
+  full_join(results_TH)
+
+## Plot all niches results
+hormones_labels <- c("Estrone" = "Estrone", "Estradiol" = "Estradiol")
+
+all_niches_results %>%
+  mutate(SampleType = fct_relevel(SampleType, "BM","TG","TH","GM")) %>%
+  ggplot(aes(x = SampleType, y = feature)) +
+  geom_tile(aes(fill = -log10(pval) * sign(coef)), color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-6, 6), na.value = "white") +
+  geom_text(aes(label = ifelse(pval < 0.05 & coef > 0, "+", ifelse(pval < 0.05 & coef < 0, "-", ""))),
+            color = "black", size = 5) +
+  scale_x_discrete(labels = hormones_labels) +
+  theme_boxplot() +
+  labs(x = "", y = "", fill = "-log10 p value") +
+  facet_grid(~metadata, 
+             scales = "free", 
+             labeller = as_labeller(hormones_labels)) +
+  theme(
+    text = element_text(size = 16),
+    legend.title = element_text(size = 14, margin = margin(b = 10)),
+    axis.text.x = element_text(size = 12, angle = 0, hjust = 0.5, vjust = 0.5),
+    axis.text.y = element_text(size = 12),
+    axis.ticks = element_line(size = 0.4),
+    strip.text = element_text(face = "bold"))
+
+ggsave("F3E.pdf", plot = last_plot(), device = "pdf", width = 8, height = 12, units = "in")
+
+```
+
+```{r, fig.width=7, fig.height=6}
+### ===========================
+###   Plot Significant Results for All Niches
+### ===========================
+
+## Filter for significant features in at least one niche
+significant_features <- all_niches_results %>%
+  filter(pval < 0.05) %>%
+  distinct(feature)
+
+## Filter the main dataframe to include only significant features
+all_niches_results_filtered <- all_niches_results %>%
+  filter(feature %in% significant_features$feature)
+
+all_niches_results_filtered %>%
+  mutate(SampleType = fct_relevel(SampleType, "BM","TG","TH","GM")) %>%
+  ggplot(aes(x = SampleType, y = feature)) +
+  geom_tile(aes(fill = -log10(pval) * sign(coef)), color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-6, 6), na.value = "white") +
+  geom_text(aes(label = ifelse(pval < 0.05 & coef > 0, "+", ifelse(pval < 0.05 & coef < 0, "-", ""))),
+            color = "black", size = 5) +
+  scale_x_discrete(labels = hormones_labels) +
+  theme_boxplot() +
+  labs(x = "", y = "", fill = "-log10 p value") +
+  facet_grid(~metadata, 
+             scales = "free", 
+             labeller = as_labeller(hormones_labels)) +
+  theme(
+    text = element_text(size = 16),
+    legend.title = element_text(size = 14, margin = margin(b = 10)),
+    axis.text.x = element_text(size = 12, angle = 0, hjust = 0.5, vjust = 0.5),
+    axis.text.y = element_text(size = 12),
+    axis.ticks = element_line(size = 0.4),
+    strip.text = element_text(face = "bold"))
+
+ggsave("F3D.pdf", plot = last_plot(), device = "pdf", width = 8, height = 8, units = "in")
+```
+
+```{r}
+# Write data to a TSV file
+write.table(all_niches_results_filtered, 
+            "Stats_MaAsLin2.tsv", 
+            sep = "\t", 
+            row.names = FALSE, 
+            quote = FALSE)
+```
+
+
+
+
+#--------------------------------
+# Other Stats
+Neisseria-Prevotella antagonism
+```{r}
+
+# Summarize the abundance data for Neisseria
+summary(s_TG$Neisseria)
+
+# Summarize the abundance data for Prevotella
+summary(s_TG$Prevotella)
+
+# Compute the Pearson correlation between the abundances of Neisseria and Prevotella
+correlation <- cor(s_TG$Neisseria, s_TG$Prevotella, method = "pearson")
+# Print the correlation value
+print(paste("Correlation between Neisseria and Prevotella:", correlation))
+
+# Perform the Pearson correlation test between Neisseria and Prevotella
+cor_test_result <- cor.test(s_TG$Neisseria, s_TG$Prevotella, method = "pearson")
+
+# Print the results of the test
+print(cor_test_result)
+
+# Visualize the data
+# Create a scatter plot with a linear trend line to visualize the relationship between Neisseria and Prevotella
+s_TG %>%
+  ggplot(aes(x = Neisseria, y = Prevotella)) +
+  geom_point(size = 4, shape = 19, alpha = 0.7, color = "darkgreen") +  # Add points to the scatter plot
+  labs(title = "Neisseria vs Prevotella in TG",
+       x = "Neisseria Abundance",
+       y = "Prevotella Abundance") +
+  stat_smooth(method = "lm", aes(group = 1), se = TRUE, fill = "lightgray", colour = "red", alpha = 0.2) +  # Add a regression line with confidence interval
+  stat_cor(aes(group = 1, label = paste(..rr.label.., ..p.label.., sep = "~`,`~")), 
+           method = "pearson", label.x = 0.1) +  # Add correlation statistics to the plot
+  theme_boxplot() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))  # Center and style the plot title
+
+# Interpret the results
+if (cor_test_result$p.value < 0.05 && correlation < 0) {
+  print("There is a significant negative correlation, suggesting possible antagonistic behavior.")
+} else {
+  print("No significant evidence of antagonistic behavior was found based on the correlation.")
+}
+
+
+```
+
+Women with hyposalivation
+```{r}
+# Summarize the percentage of women with hyposalivation
+sum(s_TG$ST_Hyposalivation == "1") *100/30
+
+# Explore the clinical data of women with hyposalivation
+s_hyposalivation <- s_TG %>%
+  filter(ST_Hyposalivation == "1")
+s_no_hyposalivation <- s_TG %>%
+  filter(ST_Hyposalivation == "0")
+
+sum(s_hyposalivation$Hyposalivation_Medication == "1") *100/sum(s_hyposalivation$ST_Hyposalivation)
+
+
+```
+
+pH - Estradiol and Estrone
+```{r}
+# Prepare data (convert pH to numeric if necessary)
+correlation_data <- s_TG %>%
+  dplyr::select(pH, Estradiol, Estrone) %>%
+  mutate(pH = as.numeric(as.character(pH))) %>%
+  na.omit()
+
+cat("Data available for correlation:", nrow(correlation_data), "samples\n\n")
+
+# === pH vs ESTRADIOL CORRELATION ===
+cat("=== pH vs ESTRADIOL ===\n")
+cor_ph_estradiol <- cor.test(correlation_data$pH, correlation_data$Estradiol, method = "spearman")
+cat("Spearman correlation: r =", round(cor_ph_estradiol$estimate, 3), "\n")
+cat("P-value:", round(cor_ph_estradiol$p.value, 4), "\n\n")
+
+# === pH vs ESTRONE CORRELATION ===
+cat("=== pH vs ESTRONE ===\n")
+cor_ph_estrone <- cor.test(correlation_data$pH, correlation_data$Estrone, method = "spearman")
+cat("Spearman correlation: r =", round(cor_ph_estrone$estimate, 3), "\n")
+cat("P-value:", round(cor_ph_estrone$p.value, 4), "\n\n")
+
+# === SCATTER PLOTS ===
+
+# pH vs Estradiol plot
+p1 <- ggplot(correlation_data, aes(x = pH, y = Estradiol)) +
+  geom_point(size = 4, alpha = 0.7, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "red", alpha = 0.3) +
+  stat_cor(method = "spearman", 
+           label.x = min(correlation_data$pH, na.rm = TRUE) + 0.1,
+           label.y = max(correlation_data$Estradiol, na.rm = TRUE) * 0.9,
+           aes(label = paste(..r.label.., ..p.label.., sep = "~`,`~"))) +
+  labs(
+    title = "pH vs Salivary Estradiol",
+    x = "pH",
+    y = "Estradiol (pg/ml)"
+  ) +
+  theme_boxplot() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# pH vs Estrone plot
+p2 <- ggplot(correlation_data, aes(x = pH, y = Estrone)) +
+  geom_point(size = 4, alpha = 0.7, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "red", alpha = 0.3) +
+  stat_cor(method = "spearman", 
+           label.x = min(correlation_data$pH, na.rm = TRUE) + 0.1,
+           label.y = max(correlation_data$Estrone, na.rm = TRUE) * 0.9,
+           aes(label = paste(..r.label.., ..p.label.., sep = "~`,`~"))) +
+  labs(
+    title = "pH vs Salivary Estrone",
+    x = "pH",
+    y = "Estrone (pg/ml)"
+  ) +
+  theme_boxplot() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Display plots
+print(p1)
+print(p2)
+
+# === RESULTS SUMMARY ===
+cat("=== SUMMARY ===\n")
+cat("pH vs Estradiol: r =", round(cor_ph_estradiol$estimate, 3),
+    ", p =", round(cor_ph_estradiol$p.value, 4), "\n")
+cat("pH vs Estrone:   r =", round(cor_ph_estrone$estimate, 3),
+    ", p =", round(cor_ph_estrone$p.value, 4), "\n")
+
+# Interpretation
+if (cor_ph_estradiol$p.value < 0.05) {
+  cat("Significant pH-Estradiol correlation\n")
+} else {
+  cat("pH-Estradiol correlation is NOT statistically significant\n")
+}
+
+if (cor_ph_estrone$p.value < 0.05) {
+  cat("Significant pH-Estrone correlation\n")
+} else {
+  cat("pH-Estrone correlation is NOT statistically significant\n")
+}
+```
+
+
+```{r}
+# Mediation Analysis: Age → Estrone → pH
+# Controlling for Salivary Flow and Menstrual Status
+library(mediation)
+library(broom)
+library(gridExtra)
+
+# === PREPARE DATA WITH CONTROLS ===
+mediation_data_controlled <- s_hormones %>%
+  dplyr::select(Age, Estrone, pH, Saliva_ST, Menstrual_Status) %>%
+  mutate(
+    pH = as.numeric(as.character(pH)),
+    Saliva_ST = as.numeric(Saliva_ST),
+    # Convert menstrual status to factor
+    Menstrual_Status = as.factor(Menstrual_Status)
+  ) %>%
+  na.omit()
+
+cat("=== CONTROLLED MEDIATION ANALYSIS ===\n")
+cat("Data available:", nrow(mediation_data_controlled), "samples\n")
+cat("Menstrual statuses:", paste(levels(mediation_data_controlled$Menstrual_Status), collapse = ", "), "\n\n")
+
+# === STANDARDIZATION OF CONTINUOUS VARIABLES ===
+cat("=== VARIABLE STANDARDIZATION ===\n")
+
+# Standardize continuous variables (mean = 0, SD = 1)
+mediation_data_std <- mediation_data_controlled %>%
+  mutate(
+    Age_std = scale(Age)[,1],
+    Estrone_std = scale(Estrone)[,1],
+    pH_std = scale(pH)[,1],
+    Saliva_ST_std = scale(Saliva_ST)[,1]
+  )
+
+# Show statistics before and after
+cat("Original variables (mean +/- SD):\n")
+cat("Age:", round(mean(mediation_data_controlled$Age), 1), "+/-", round(sd(mediation_data_controlled$Age), 1), "\n")
+cat("Estrone:", round(mean(mediation_data_controlled$Estrone), 1), "+/-", round(sd(mediation_data_controlled$Estrone), 1), "\n")
+cat("pH:", round(mean(mediation_data_controlled$pH), 2), "+/-", round(sd(mediation_data_controlled$pH), 2), "\n")
+cat("Salivary flow:", round(mean(mediation_data_controlled$Saliva_ST), 2), "+/-", round(sd(mediation_data_controlled$Saliva_ST), 2), "\n\n")
+
+cat("Standardized variables (verification - should be 0 +/- 1):\n")
+cat("Age_std:", round(mean(mediation_data_std$Age_std), 3), "+/-", round(sd(mediation_data_std$Age_std), 3), "\n")
+cat("Estrone_std:", round(mean(mediation_data_std$Estrone_std), 3), "+/-", round(sd(mediation_data_std$Estrone_std), 3), "\n")
+cat("pH_std:", round(mean(mediation_data_std$pH_std), 3), "+/-", round(sd(mediation_data_std$pH_std), 3), "\n")
+cat("Flow_std:", round(mean(mediation_data_std$Saliva_ST_std), 3), "+/-", round(sd(mediation_data_std$Saliva_ST_std), 3), "\n\n")
+
+# === ANALYSIS WITHOUT CONTROLS (BASIC MODEL) ===
+cat("=== BASIC MODEL (WITHOUT CONTROLS) ===\n")
+
+# Basic models with standardized variables
+model_a_basic <- lm(Estrone_std ~ Age_std, data = mediation_data_std)
+model_b_basic <- lm(pH_std ~ Estrone_std, data = mediation_data_std)
+model_c_basic <- lm(pH_std ~ Age_std, data = mediation_data_std)
+model_direct_basic <- lm(pH_std ~ Age_std + Estrone_std, data = mediation_data_std)
+
+cat("Path a (Age -> Estrone): beta =", round(coef(model_a_basic)["Age_std"], 3),
+    ", p =", round(summary(model_a_basic)$coefficients["Age_std", "Pr(>|t|)"], 4), "\n")
+cat("Path b (Estrone -> pH): beta =", round(coef(model_b_basic)["Estrone_std"], 3),
+    ", p =", round(summary(model_b_basic)$coefficients["Estrone_std", "Pr(>|t|)"], 4), "\n")
+cat("Total effect (c): beta =", round(coef(model_c_basic)["Age_std"], 3),
+    ", p =", round(summary(model_c_basic)$coefficients["Age_std", "Pr(>|t|)"], 4), "\n")
+cat("Direct effect (c'): beta =", round(coef(model_direct_basic)["Age_std"], 3),
+    ", p =", round(summary(model_direct_basic)$coefficients["Age_std", "Pr(>|t|)"], 4), "\n\n")
+
+# === CONTROLLED ANALYSIS ===
+cat("=== CONTROLLED MODEL (WITH SALIVARY FLOW AND MENSTRUAL STATUS) ===\n")
+
+# Controlled models
+model_a_controlled <- lm(Estrone_std ~ Age_std + Saliva_ST_std + Menstrual_Status,
+                        data = mediation_data_std)
+model_b_controlled <- lm(pH_std ~ Estrone_std + Saliva_ST_std + Menstrual_Status,
+                        data = mediation_data_std)
+model_c_controlled <- lm(pH_std ~ Age_std + Saliva_ST_std + Menstrual_Status,
+                        data = mediation_data_std)
+model_direct_controlled <- lm(pH_std ~ Age_std + Estrone_std + Saliva_ST_std + Menstrual_Status,
+                             data = mediation_data_std)
+
+cat("Controlled path a (Age -> Estrone): beta =", round(coef(model_a_controlled)["Age_std"], 3),
+    ", p =", round(summary(model_a_controlled)$coefficients["Age_std", "Pr(>|t|)"], 4), "\n")
+cat("Controlled path b (Estrone -> pH): beta =", round(coef(model_b_controlled)["Estrone_std"], 3),
+    ", p =", round(summary(model_b_controlled)$coefficients["Estrone_std", "Pr(>|t|)"], 4), "\n")
+cat("Controlled total effect (c): beta =", round(coef(model_c_controlled)["Age_std"], 3),
+    ", p =", round(summary(model_c_controlled)$coefficients["Age_std", "Pr(>|t|)"], 4), "\n")
+cat("Controlled direct effect (c'): beta =", round(coef(model_direct_controlled)["Age_std"], 3),
+    ", p =", round(summary(model_direct_controlled)$coefficients["Age_std", "Pr(>|t|)"], 4), "\n\n")
+
+# === MODEL COMPARISON ===
+cat("=== COMPARISON: BASIC vs CONTROLLED ===\n")
+
+# Create comparison table
+comparison_table <- data.frame(
+  Path = c("a (Age -> Estrone)", "b (Estrone -> pH)", "c (Total effect)", "c' (Direct effect)"),
+  Basic_Beta = c(
+    round(coef(model_a_basic)["Age_std"], 3),
+    round(coef(model_b_basic)["Estrone_std"], 3),
+    round(coef(model_c_basic)["Age_std"], 3),
+    round(coef(model_direct_basic)["Age_std"], 3)
+  ),
+  Basico_p = c(
+    round(summary(model_a_basic)$coefficients["Age_std", "Pr(>|t|)"], 4),
+    round(summary(model_b_basic)$coefficients["Estrone_std", "Pr(>|t|)"], 4),
+    round(summary(model_c_basic)$coefficients["Age_std", "Pr(>|t|)"], 4),
+    round(summary(model_direct_basic)$coefficients["Age_std", "Pr(>|t|)"], 4)
+  ),
+  Controlado_Beta = c(
+    round(coef(model_a_controlled)["Age_std"], 3),
+    round(coef(model_b_controlled)["Estrone_std"], 3),
+    round(coef(model_c_controlled)["Age_std"], 3),
+    round(coef(model_direct_controlled)["Age_std"], 3)
+  ),
+  Controlado_p = c(
+    round(summary(model_a_controlled)$coefficients["Age_std", "Pr(>|t|)"], 4),
+    round(summary(model_b_controlled)$coefficients["Estrone_std", "Pr(>|t|)"], 4),
+    round(summary(model_c_controlled)$coefficients["Age_std", "Pr(>|t|)"], 4),
+    round(summary(model_direct_controlled)$coefficients["Age_std", "Pr(>|t|)"], 4)
+  )
+)
+
+print(comparison_table)
+
+# === CONTROL VARIABLES ANALYSIS ===
+cat("\n=== EFFECT OF CONTROL VARIABLES ===\n")
+
+# Effect of salivary flow
+cat("Effect of salivary flow on pH: beta =",
+    round(coef(model_direct_controlled)["Saliva_ST_std"], 3),
+    ", p =", round(summary(model_direct_controlled)$coefficients["Saliva_ST_std", "Pr(>|t|)"], 4), "\n")
+
+# Effect of menstrual status
+menstrual_effects <- summary(model_direct_controlled)$coefficients
+menstrual_rows <- grep("Menstrual_Status", rownames(menstrual_effects))
+if (length(menstrual_rows) > 0) {
+  cat("Effects of menstrual status on pH:\n")
+  for (i in menstrual_rows) {
+    cat("  ", rownames(menstrual_effects)[i], ": beta =",
+        round(menstrual_effects[i, "Estimate"], 3),
+        ", p =", round(menstrual_effects[i, "Pr(>|t|)"], 4), "\n")
+  }
+}
+
+# === ADJUSTED R-SQUARED FOR MODEL EVALUATION ===
+cat("\n=== MODEL FIT (Adjusted R-squared) ===\n")
+cat("Basic model (pH ~ Age + Estrone): R-sq =",
+    round(summary(model_direct_basic)$adj.r.squared, 3), "\n")
+cat("Controlled model (pH ~ Age + Estrone + controls): R-sq =",
+    round(summary(model_direct_controlled)$adj.r.squared, 3), "\n")
+
+# === FORMAL MEDIATION ANALYSIS WITH CONTROLS ===
+cat("\n=== FORMAL MEDIATION WITH CONTROLS ===\n")
+
+if (requireNamespace("mediation", quietly = TRUE)) {
+  
+  set.seed(123)
+  mediation_controlled <- mediate(model_a_controlled, model_direct_controlled, 
+                                 treat = "Age_std", mediator = "Estrone_std", 
+                                 boot = TRUE, sims = 1000)
+  
+  cat("Controlled indirect effect (ACME): beta =", round(mediation_controlled$d0, 3),
+      ", 95% CI: [", round(mediation_controlled$d0.ci[1], 3), ", ",
+      round(mediation_controlled$d0.ci[2], 3), "], p =", round(mediation_controlled$d0.p, 4), "\n")
+
+  cat("Controlled direct effect (ADE): beta =", round(mediation_controlled$z0, 3),
+      ", 95% CI: [", round(mediation_controlled$z0.ci[1], 3), ", ",
+      round(mediation_controlled$z0.ci[2], 3), "], p =", round(mediation_controlled$z0.p, 4), "\n")
+
+  if (!is.na(mediation_controlled$n0)) {
+    cat("Proportion mediated: ", round(mediation_controlled$n0 * 100, 1), "%\n")
+  }
+}
+
+# === FINAL SUMMARY ===
+cat("\n=== FINAL RECOMMENDATIONS ===\n")
+cat("1. STANDARDIZATION: Done (comparable coefficients)\n")
+cat("2. CONTROLS: Salivary flow and menstrual status included\n")
+cat("3. ROBUSTNESS: Compare basic vs controlled models\n")
+cat("4. INTERPRETATION: Use standardized coefficients (betas)\n")
+
+# Save results
+write.table(comparison_table, "mediation_comparison_controlled.tsv",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+cat("\nFile saved: mediation_comparison_controlled.tsv\n")
+```
+
+pH - age
+```{r}
+# Preparar datos
+correlation_data <- s_TG %>%
+  dplyr::select(pH, Age) %>%
+  mutate(pH = as.numeric(as.character(pH))) %>%
+  na.omit()
+
+cat("Data available for correlation:", nrow(correlation_data), "samples\n\n")
+
+# === pH vs AGE CORRELATION ===
+cat("=== pH vs AGE ===\n")
+cor_ph_age <- cor.test(correlation_data$pH, correlation_data$Age, method = "spearman")
+cat("Spearman correlation: r =", round(cor_ph_age$estimate, 3), "\n")
+cat("P-value:", round(cor_ph_age$p.value, 4), "\n\n")
+
+# === SCATTER PLOT ===
+p <- ggplot(correlation_data, aes(x = Age, y = pH)) +
+  geom_point(size = 4, alpha = 0.7, color = "darkorange") +
+  geom_smooth(method = "lm", se = TRUE, color = "red", alpha = 0.3) +
+  stat_cor(method = "spearman", 
+           label.x = min(correlation_data$Age, na.rm = TRUE) + 2,
+           label.y = max(correlation_data$pH, na.rm = TRUE) * 0.95,
+           aes(label = paste(..r.label.., ..p.label.., sep = "~`,`~"))) +
+  labs(
+    title = "pH vs Age",
+    x = "Age (years)",
+    y = "pH"
+  ) +
+  theme_boxplot() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p)
+
+# === INTERPRETATION ===
+cat("=== INTERPRETATION ===\n")
+cat("pH vs Age: r =", round(cor_ph_age$estimate, 3),
+    ", p =", round(cor_ph_age$p.value, 4), "\n")
+
+if (cor_ph_age$p.value < 0.05) {
+  cat("Significant pH-Age correlation\n")
+  if (cor_ph_age$estimate > 0) {
+    cat("POSITIVE correlation: pH tends to increase with age\n")
+  } else {
+    cat("NEGATIVE correlation: pH tends to decrease with age\n")
+  }
+} else {
+  cat("pH-Age correlation is NOT statistically significant\n")
+}
+
+# === DESCRIPTIVE STATISTICS ===
+cat("\n=== DESCRIPTIVE STATISTICS ===\n")
+cat("pH - Mean:", round(mean(correlation_data$pH, na.rm = TRUE), 2),
+    ", SD:", round(sd(correlation_data$pH, na.rm = TRUE), 2), "\n")
+cat("Age - Mean:", round(mean(correlation_data$Age, na.rm = TRUE), 1),
+    ", SD:", round(sd(correlation_data$Age, na.rm = TRUE), 1), "\n")
+
+```
+
+
+```{r}
+# Preparar datos
+correlation_data <- s_hormones %>%
+  dplyr::select(pH, Saliva_ST) %>%
+  mutate(pH = as.numeric(as.character(pH))) %>%
+  na.omit()
+
+cat("Data available for correlation:", nrow(correlation_data), "samples\n\n")
+
+# === pH vs SALIVARY FLOW CORRELATION ===
+cat("=== pH vs SALIVARY FLOW ===\n")
+cor_ph_flow <- cor.test(correlation_data$pH, correlation_data$Saliva_ST, method = "spearman")
+cat("Spearman correlation: r =", round(cor_ph_flow$estimate, 3), "\n")
+cat("P-value:", round(cor_ph_flow$p.value, 4), "\n\n")
+
+# === SCATTER PLOT ===
+p <- ggplot(correlation_data, aes(x = Saliva_ST, y = pH)) +
+  geom_point(size = 4, alpha = 0.7, color = "darkblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red", alpha = 0.3) +
+  stat_cor(method = "spearman", 
+           label.x = min(correlation_data$Saliva_ST, na.rm = TRUE) + 0.1,
+           label.y = max(correlation_data$pH, na.rm = TRUE) * 0.95,
+           aes(label = paste(..r.label.., ..p.label.., sep = "~`,`~"))) +
+  labs(
+    title = "pH vs Salivary Flow Rate",
+    x = "Salivary Flow Rate (mL/min)",
+    y = "pH"
+  ) +
+  theme_boxplot() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p)
+
+# === ANALYSIS BY FLOW CATEGORIES ===
+cat("=== ANALYSIS BY SALIVARY FLOW CATEGORIES ===\n")
+
+# Create flow categories
+correlation_data_cat <- correlation_data %>%
+  mutate(
+    Flow_Category = case_when(
+      Saliva_ST < 1.0 ~ "Low (<1.0)",
+      Saliva_ST >= 1.0 & Saliva_ST < 2.0 ~ "Normal (1.0-2.0)",
+      Saliva_ST >= 2.0 ~ "High (>=2.0)"
+    ),
+    Flow_Category = factor(Flow_Category, levels = c("Low (<1.0)", "Normal (1.0-2.0)", "High (>=2.0)"))
+  )
+
+# Statistics by category
+flow_stats <- correlation_data_cat %>%
+  group_by(Flow_Category) %>%
+  summarise(
+    n = n(),
+    pH_mean = round(mean(pH, na.rm = TRUE), 2),
+    pH_sd = round(sd(pH, na.rm = TRUE), 2),
+    pH_median = round(median(pH, na.rm = TRUE), 2),
+    .groups = 'drop'
+  )
+
+cat("pH statistics by flow category:\n")
+print(flow_stats)
+
+# Boxplot
+p2 <- ggplot(correlation_data_cat, aes(x = Flow_Category, y = pH, fill = Flow_Category)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "white") +
+  labs(
+    title = "pH Distribution by Salivary Flow Category",
+    x = "Salivary Flow Category",
+    y = "pH"
+  ) +
+  scale_fill_brewer(type = "qual", palette = "Set2") +
+  theme_boxplot() +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none")
+
+print(p2)
+
+# === ANOVA TEST FOR DIFFERENCES BETWEEN GROUPS ===
+if (length(unique(correlation_data_cat$Flow_Category)) > 1) {
+  anova_result <- aov(pH ~ Flow_Category, data = correlation_data_cat)
+  anova_p <- summary(anova_result)[[1]][["Pr(>F)"]][1]
+  
+  cat("\n=== ANOVA: pH differences between flow categories ===\n")
+  cat("F-test p-value:", round(anova_p, 4), "\n")
+  
+  if (anova_p < 0.05) {
+    cat("✓ Significant differences exist between groups\n")
+    
+    # Post-hoc tests if there are differences
+    if (requireNamespace("agricolae", quietly = TRUE)) {
+      library(agricolae)
+      tukey_result <- HSD.test(anova_result, "Flow_Category")
+      cat("Homogeneous groups (Tukey HSD):\n")
+      print(tukey_result$groups)
+    }
+  } else {
+    cat("No significant differences between groups\n")
+  }
+}
+
+# === DESCRIPTIVE STATISTICS ===
+cat("\n=== DESCRIPTIVE STATISTICS ===\n")
+cat("pH - Mean:", round(mean(correlation_data$pH, na.rm = TRUE), 2),
+    ", SD:", round(sd(correlation_data$pH, na.rm = TRUE), 2), "\n")
+cat("Salivary flow - Mean:", round(mean(correlation_data$Saliva_ST, na.rm = TRUE), 2),
+    ", SD:", round(sd(correlation_data$Saliva_ST, na.rm = TRUE), 2), "\n")
+cat("Flow range: [", round(min(correlation_data$Saliva_ST), 2), " - ",
+    round(max(correlation_data$Saliva_ST), 2), "] ml/min\n")
+
+# === INTERPRETATION ===
+cat("\n=== INTERPRETATION ===\n")
+cat("pH vs Salivary flow: r =", round(cor_ph_flow$estimate, 3),
+    ", p =", round(cor_ph_flow$p.value, 4), "\n")
+
+if (cor_ph_flow$p.value < 0.05) {
+  cat("Significant pH-Salivary flow correlation\n")
+  if (cor_ph_flow$estimate > 0) {
+    cat("POSITIVE correlation: higher flow associated with higher pH (more alkaline)\n")
+    cat("Interpretation: Higher salivary volume may dilute acids and raise pH\n")
+  } else {
+    cat("NEGATIVE correlation: higher flow associated with lower pH (more acidic)\n")
+    cat("Interpretation: Higher flow may increase bacterial metabolic activity\n")
+  }
+} else {
+  cat("pH-Salivary flow correlation is NOT statistically significant\n")
+  cat("Salivary flow does not appear to linearly influence pH\n")
+}
+
+# Effect size
+if (abs(cor_ph_flow$estimate) >= 0.5) {
+  effect_size <- "LARGE"
+} else if (abs(cor_ph_flow$estimate) >= 0.3) {
+  effect_size <- "MODERATE"
+} else if (abs(cor_ph_flow$estimate) >= 0.1) {
+  effect_size <- "SMALL"
+} else {
+  effect_size <- "NEGLIGIBLE"
+}
+
+cat("Effect size:", effect_size, "\n")
+```
+
+Oral status - bacterial abundance
+```{r}
+# Load required libraries
+library(pheatmap)
+library(gridExtra)
+library(Hmisc)
+
+# === INITIAL CONFIGURATION ===
+# Define niches and their corresponding dataframes
+niches <- list(
+  "TG" = s_TG,
+  "GM" = s_GM, 
+  "TH" = s_TH,
+  "BM" = s_BM
+)
+
+# Clinical variables of interest
+clinical_vars <- c("pH", "Healthy", "Decay", "Missing", "Filling", "CAO", "Periodontal_Diagnosis")
+
+# Readable labels for clinical variables
+clinical_labels <- c(
+  "pH" = "pH",
+  "Healthy" = "Healthy Teeth",
+  "Decay" = "Decayed Teeth", 
+  "Missing" = "Missing Teeth",
+  "Filling" = "Filled Teeth",
+  "CAO" = "CAO Index",
+  "Periodontal_Diagnosis" = "Periodontal Status"
+)
+
+# === FUNCTION TO CALCULATE CORRELATIONS ===
+calculate_correlations <- function(clinical_data, bacteria_data, niche_name) {
+  
+  correlation_results <- data.frame()
+  
+  for (clinical_var in names(clinical_data)) {
+    for (bacteria_var in names(bacteria_data)) {
+      
+      # Extract valid data (without NA)
+      clinical_vals <- clinical_data[[clinical_var]]
+      bacteria_vals <- bacteria_data[[bacteria_var]]
+      
+      # Verify that both variables are numeric
+      if (!is.numeric(clinical_vals) || !is.numeric(bacteria_vals)) {
+        next
+      }
+      
+      # Combine and remove NAs
+      combined_data <- data.frame(
+        clinical = clinical_vals,
+        bacteria = bacteria_vals
+      ) %>% 
+        na.omit()
+      
+      # Verify there is variation in the data
+      if (nrow(combined_data) > 5 && 
+          var(combined_data$clinical, na.rm = TRUE) > 0 && 
+          var(combined_data$bacteria, na.rm = TRUE) > 0) {
+        
+        # Attempt correlation
+        tryCatch({
+          cor_test <- cor.test(combined_data$clinical, combined_data$bacteria, 
+                              method = "spearman")
+          
+          # Save results
+          correlation_results <- rbind(correlation_results, data.frame(
+            Niche = niche_name,
+            Clinical_Variable = clinical_var,
+            Bacteria = bacteria_var,
+            Correlation = as.numeric(cor_test$estimate),
+            P_value = cor_test$p.value,
+            N_samples = nrow(combined_data)
+          ))
+        }, error = function(e) {
+          # Silence errors for bulk analysis
+        })
+      }
+    }
+  }
+  
+  return(correlation_results)
+}
+
+# === FUNCTION TO CREATE HEATMAP BY NICHE ===
+create_niche_heatmap <- function(significant_correlations, niche_name) {
+  
+  if (nrow(significant_correlations) == 0) {
+    cat("No significant correlations for", niche_name, "\n")
+    return(NULL)
+  }
+  
+  # Prepare data for heatmap
+  heatmap_data <- significant_correlations %>%
+    select(Clinical_Variable, Bacteria, Correlation) %>%
+    pivot_wider(names_from = Bacteria, values_from = Correlation, values_fill = 0)
+  
+  # Convert to matrix
+  correlation_matrix <- as.matrix(heatmap_data[, -1])
+  rownames(correlation_matrix) <- heatmap_data$Clinical_Variable
+  
+  # Apply readable labels
+  rownames(correlation_matrix) <- clinical_labels[rownames(correlation_matrix)]
+  
+  # Clean bacteria names
+  bacteria_names_clean <- colnames(correlation_matrix)
+  bacteria_names_clean <- gsub("_", " ", bacteria_names_clean)
+  bacteria_names_clean <- gsub("\\[.*?\\]", "", bacteria_names_clean)
+  bacteria_names_clean <- gsub("\\(.*?\\)", "", bacteria_names_clean)
+  bacteria_names_clean <- gsub("\\s+", " ", bacteria_names_clean)
+  bacteria_names_clean <- trimws(bacteria_names_clean)
+  bacteria_names_clean <- ifelse(nchar(bacteria_names_clean) > 15, 
+                                paste0(substr(bacteria_names_clean, 1, 15), "..."), 
+                                bacteria_names_clean)
+  colnames(correlation_matrix) <- bacteria_names_clean
+  
+  # Create heatmap
+  pheatmap(correlation_matrix,
+           color = colorRampPalette(c("blue", "white", "red"))(100),
+           breaks = seq(-1, 1, length.out = 101),
+           cluster_rows = TRUE,
+           cluster_cols = TRUE,
+           fontsize_row = 8,
+           fontsize_col = 6,
+           main = paste("Significant Correlations -", niche_name, "Niche"))
+  
+  return(correlation_matrix)
+}
+
+# === MAIN ANALYSIS BY NICHE ===
+all_results <- list()
+all_significant <- list()
+
+cat("=== STARTING NICHE-BY-NICHE ANALYSIS ===\n\n")
+
+for (niche_name in names(niches)) {
+  
+  cat("==== ANALYZING NICHE:", niche_name, "====\n")
+  
+  # Get dataframe for niche
+  niche_data <- niches[[niche_name]]
+  
+  # Verify that the dataframe exists and has data
+  if (is.null(niche_data) || nrow(niche_data) == 0) {
+    cat("Warning: No data available for niche", niche_name, "\n\n")
+    next
+  }
+  
+  # Identify bacteria columns
+  bacteria_start_col <- which(names(niche_data) == "Absconditabacteria_(SR1) Absconditabacteria_(SR1)_[G-1]")
+  
+  if (length(bacteria_start_col) == 0) {
+    cat("Warning: No bacteria columns found in", niche_name, "\n\n")
+    next
+  }
+  
+  bacteria_cols <- names(niche_data)[bacteria_start_col:ncol(niche_data)]
+  
+  # Prepare clinical and bacterial data
+  clinical_data <- niche_data[, clinical_vars] %>%
+    mutate_all(~as.numeric(as.character(.)))
+  
+  bacteria_data <- niche_data[, bacteria_cols]
+  
+  cat("Available samples:", nrow(niche_data), "\n")
+  cat("Clinical variables:", length(clinical_vars), "\n")
+  cat("Bacteria:", length(bacteria_cols), "\n")
+  
+  # Calculate correlations
+  cat("Calculating correlations for", niche_name, "...\n")
+  niche_correlations <- calculate_correlations(clinical_data, bacteria_data, niche_name)
+  
+  # Filter significant correlations
+  niche_significant <- niche_correlations %>%
+    filter(P_value < 0.05) %>%
+    arrange(P_value)
+  
+  cat("Significant correlations (p < 0.05):", nrow(niche_significant), "\n")
+  
+  # Store results
+  all_results[[niche_name]] <- niche_correlations
+  all_significant[[niche_name]] <- niche_significant
+  
+  # Show top 10 correlations for this niche
+  if (nrow(niche_significant) > 0) {
+    cat("\nTop 10 most significant correlations in", niche_name, ":\n")
+    print(head(niche_significant[, c("Clinical_Variable", "Bacteria", "Correlation", "P_value")], 10))
+    
+    # Create heatmap for this niche
+    cat("\nCreating heatmap for", niche_name, "...\n")
+    create_niche_heatmap(niche_significant, niche_name)
+    
+  } else {
+    cat("No significant correlations found in", niche_name, "\n")
+  }
+  
+  cat("\n" , rep("=", 50), "\n\n")
+}
+
+# === COMPARATIVE ANALYSIS BETWEEN NICHES ===
+cat("=== COMPARATIVE SUMMARY BETWEEN NICHES ===\n\n")
+
+# Create summary table
+summary_table <- data.frame()
+
+for (niche_name in names(all_significant)) {
+  sig_cors <- all_significant[[niche_name]]
+  
+  if (nrow(sig_cors) > 0) {
+    niche_summary <- data.frame(
+      Niche = niche_name,
+      Total_Significant_Correlations = nrow(sig_cors),
+      Strongest_Correlation = max(abs(sig_cors$Correlation)),
+      Most_Correlated_Variable = sig_cors$Clinical_Variable[which.max(abs(sig_cors$Correlation))],
+      Most_Correlated_Bacteria = sig_cors$Bacteria[which.max(abs(sig_cors$Correlation))]
+    )
+  } else {
+    niche_summary <- data.frame(
+      Niche = niche_name,
+      Total_Significant_Correlations = 0,
+      Strongest_Correlation = NA,
+      Most_Correlated_Variable = NA,
+      Most_Correlated_Bacteria = NA
+    )
+  }
+  
+  summary_table <- rbind(summary_table, niche_summary)
+}
+
+print(summary_table)
+
+# === SAVE RESULTS ===
+cat("\n=== SAVING RESULTS ===\n")
+
+# Combine all results
+all_correlations_combined <- do.call(rbind, all_results)
+all_significant_combined <- do.call(rbind, all_significant)
+
+# Save files by niche
+for (niche_name in names(all_results)) {
+  
+  # All correlations for niche
+  write.table(all_results[[niche_name]], 
+              paste0("correlations_", niche_name, "_all.tsv"), 
+              sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  # Only significant correlations for niche
+  if (nrow(all_significant[[niche_name]]) > 0) {
+    write.table(all_significant[[niche_name]], 
+                paste0("correlations_", niche_name, "_significant.tsv"), 
+                sep = "\t", row.names = FALSE, quote = FALSE)
+  }
+}
+
+# Save combined files
+write.table(all_correlations_combined, "correlations_all_niches_combined.tsv", 
+            sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(all_significant_combined, "correlations_all_niches_significant.tsv", 
+            sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(summary_table, "correlations_summary_by_niche.tsv", 
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+cat("Files saved:\n")
+cat("- correlations_[NICHE]_all.tsv (for each niche)\n")
+cat("- correlations_[NICHE]_significant.tsv (for each niche)\n")
+cat("- correlations_all_niches_combined.tsv (all niches)\n")
+cat("- correlations_all_niches_significant.tsv (significant from all)\n")
+cat("- correlations_summary_by_niche.tsv (comparative summary)\n")
+
+cat("\nANALYSIS COMPLETED!\n")
+```
+
+
